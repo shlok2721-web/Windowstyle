@@ -223,15 +223,15 @@ pub fn button(ui: &mut Ui, label: &str, primary: bool) -> Response {
         ui.data_mut(|d| d.insert_temp(Id::new(("dialog_button_focused", vp)), true));
     }
     let (fill, border, width) = if down {
-        (colors::btn_pressed_fill(), colors::btn_pressed_border(), 1.0)
+        (
+            colors::btn_pressed_fill(),
+            colors::btn_pressed_border(),
+            1.0,
+        )
     } else if resp.hovered() {
         (colors::btn_hover_fill(), colors::btn_hover_border(), 1.0)
     } else if primary || focused {
-        (
-            ui.visuals().widgets.inactive.bg_fill,
-            colors::accent(),
-            2.0,
-        )
+        (ui.visuals().widgets.inactive.bg_fill, colors::accent(), 2.0)
     } else {
         (
             ui.visuals().widgets.inactive.bg_fill,

@@ -762,11 +762,15 @@ impl Ribbon {
                 typed,
             )
         });
-        let (focused, pointer_down, now) =
-            ctx.input(|i| (i.focused, i.pointer.any_down() || i.pointer.any_pressed(), i.time));
-        let (prev_alt, used, alt_since): (bool, bool, f64) = ctx
-            .data(|d| d.get_temp(id))
-            .unwrap_or((false, false, 0.0));
+        let (focused, pointer_down, now) = ctx.input(|i| {
+            (
+                i.focused,
+                i.pointer.any_down() || i.pointer.any_pressed(),
+                i.time,
+            )
+        });
+        let (prev_alt, used, alt_since): (bool, bool, f64) =
+            ctx.data(|d| d.get_temp(id)).unwrap_or((false, false, 0.0));
         // Alt only counts as a "key tips" gesture when it is pressed and released on its own,
         // quickly, while this window has focus. Window managers (Hyprland, sway, ...) grab
         // Alt+<key> shortcuts and focus changes: the app then sees a bare Alt release that was
@@ -776,7 +780,11 @@ impl Ribbon {
         } else {
             false
         };
-        let alt_since = if alt_down && !prev_alt { now } else { alt_since };
+        let alt_since = if alt_down && !prev_alt {
+            now
+        } else {
+            alt_since
+        };
         let quick_tap = now - alt_since <= KEY_TIP_TAP_MAX_SECS;
         if !focused || pointer_down {
             // Losing focus or clicking dismisses tips that are showing.
@@ -1157,8 +1165,12 @@ fn draw_group(
     let mut activated = false;
     // When the caption is wider than the commands (e.g. one large button under a long
     // caption) centre the commands under it instead of leaving them stuck to the left edge.
-    let items_w: f32 =
-        g.items.iter().map(|i| item_width(ui, i, &font)).sum::<f32>() + 2.0 * g.items.len() as f32;
+    let items_w: f32 = g
+        .items
+        .iter()
+        .map(|i| item_width(ui, i, &font))
+        .sum::<f32>()
+        + 2.0 * g.items.len() as f32;
     let mut x = rect.left() + ((rect.width() - items_w) / 2.0).max(0.0);
     let top = rect.top() + 2.0;
     for (ii, it) in g.items.iter().enumerate() {
@@ -1999,7 +2011,10 @@ fn menu_sub_row(
     Icon::ChevronRight.paint(
         &p,
         Rect::from_center_size(
-            pos2(rect.right() - MENU_RIGHT - MENU_ARROW_W / 2.0, rect.center().y),
+            pos2(
+                rect.right() - MENU_RIGHT - MENU_ARROW_W / 2.0,
+                rect.center().y,
+            ),
             vec2(MENU_ARROW_W, MENU_ARROW_W),
         ),
         true,

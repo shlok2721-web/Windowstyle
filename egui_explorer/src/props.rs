@@ -443,24 +443,26 @@ fn tree_rows(rows: &mut Vec<Row>, snap: &Snapshot, fmt: fn(SystemTime) -> String
         push(rows, "Symbolic links", group_digits(s.symlinks));
     }
     if let Some((name, len)) = &s.largest {
-        push(rows, "Largest file", format!("{name} ({})", human_size(*len)));
+        push(
+            rows,
+            "Largest file",
+            format!("{name} ({})", human_size(*len)),
+        );
     }
     push_time(rows, "Latest change", s.newest, fmt);
     if snap.done && s.unreadable > 0 {
         push(
             rows,
             "Skipped",
-            format!("{} could not be read", plural(s.unreadable, "item", "items")),
+            format!(
+                "{} could not be read",
+                plural(s.unreadable, "item", "items")
+            ),
         );
     }
 }
 
-fn single_rows(
-    rows: &mut Vec<Row>,
-    e: &Entry,
-    snap: &Snapshot,
-    fmt: fn(SystemTime) -> String,
-) {
+fn single_rows(rows: &mut Vec<Row>, e: &Entry, snap: &Snapshot, fmt: fn(SystemTime) -> String) {
     push(rows, "Type", e.type_name.clone());
     let parent = e
         .path

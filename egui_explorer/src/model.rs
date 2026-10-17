@@ -105,8 +105,8 @@ impl Entry {
 
 /// Suffixes recognised as archives / compressed files, longest compound suffixes first.
 const ARCHIVE_SUFFIXES: [&str; 17] = [
-    ".tar.gz", ".tar.xz", ".tar.bz2", ".tar.zst", ".tgz", ".txz", ".tbz2", ".tbz", ".tzst",
-    ".tar", ".zip", ".7z", ".rar", ".gz", ".xz", ".bz2", ".zst",
+    ".tar.gz", ".tar.xz", ".tar.bz2", ".tar.zst", ".tgz", ".txz", ".tbz2", ".tbz", ".tzst", ".tar",
+    ".zip", ".7z", ".rar", ".gz", ".xz", ".bz2", ".zst",
 ];
 
 /// The file name without its archive suffix (`"a.tar.gz"` -> `"a"`), or `None` when `name`

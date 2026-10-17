@@ -12,12 +12,10 @@ use egui::{
 };
 
 use crate::icons::Icon;
-use crate::{dialogs, file_list, props};
 use crate::model::*;
-use crate::ribbon::{
-    BODY_H, Ribbon, TAB_H, context_menu, menu_frame, menu_row, menu_separator,
-};
+use crate::ribbon::{BODY_H, Ribbon, TAB_H, context_menu, menu_frame, menu_row, menu_separator};
 use crate::theme::{self, colors};
+use crate::{dialogs, file_list, props};
 
 const TITLE_H: f32 = 31.0;
 const QAT_H: f32 = 25.0;
@@ -1098,7 +1096,9 @@ fn info_windows(ctx: &egui::Context, state: &mut ExplorerState) {
                                 egui::Layout::top_down_justified(egui::Align::Min),
                                 |ui| {
                                     for (i, label) in history.iter().enumerate().rev() {
-                                        if ui.selectable_label(i == cursor, label.as_str()).clicked()
+                                        if ui
+                                            .selectable_label(i == cursor, label.as_str())
+                                            .clicked()
                                         {
                                             jump = Some(i);
                                         }
@@ -1241,7 +1241,9 @@ fn info_windows(ctx: &egui::Context, state: &mut ExplorerState) {
     state.compress_password = pw;
     state.compress_password2 = pw2;
     // Never start compressing while the two password fields disagree.
-    if run_compress && fmt.supports_password() && state.compress_password != state.compress_password2
+    if run_compress
+        && fmt.supports_password()
+        && state.compress_password != state.compress_password2
     {
         run_compress = false;
     }

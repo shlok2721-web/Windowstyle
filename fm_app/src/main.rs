@@ -903,13 +903,11 @@ impl App {
     fn spawn_job(&mut self, work: impl FnOnce() -> JobOutcome + Send + 'static) {
         let sender = self.worker_messages_sender();
         let wake = self.egui_ctx.clone();
-        let spawned = thread::Builder::new()
-            .name("fm-job".into())
-            .spawn(move || {
-                let outcome = work();
-                let _ = sender.send(WorkerMessage::Job(outcome));
-                wake.request_repaint();
-            });
+        let spawned = thread::Builder::new().name("fm-job".into()).spawn(move || {
+            let outcome = work();
+            let _ = sender.send(WorkerMessage::Job(outcome));
+            wake.request_repaint();
+        });
         match spawned {
             Ok(_) => self.jobs_running += 1,
             Err(error) => self.status = format!("Could not start background job: {error}"),
@@ -1078,8 +1076,8 @@ impl App {
                 }
             }
             None => {
-                self.status = "Copied inside Windowstyle only (system clipboard unavailable)."
-                    .to_string();
+                self.status =
+                    "Copied inside Windowstyle only (system clipboard unavailable).".to_string();
             }
         }
     }
@@ -1322,8 +1320,7 @@ impl App {
         if let Some((root, entries, message)) = outcome.search {
             // Only the newest search may replace the listing, and only if the user is
             // still looking at the folder it searched.
-            if outcome.search_generation == self.search_generation && self.state.location == root
-            {
+            if outcome.search_generation == self.search_generation && self.state.location == root {
                 self.state.set_location(root, entries);
                 self.attach_current_thumbnails();
                 self.status = message;
@@ -2057,7 +2054,10 @@ impl App {
     /// Open `start` in a new window of this process (no new process, no second set of caches).
     fn open_window(&mut self, ctx: &egui::Context, start: PathBuf) {
         if self.children.len() >= MAX_CHILD_WINDOWS {
-            self.status = format!("At most {} windows can be open at once.", MAX_CHILD_WINDOWS + 1);
+            self.status = format!(
+                "At most {} windows can be open at once.",
+                MAX_CHILD_WINDOWS + 1
+            );
             return;
         }
         let start = if start.is_dir() {
@@ -2480,114 +2480,114 @@ fn compress_job(
         ..JobOutcome::default()
     };
     let password = password.as_deref();
-        let level = level.clamp(1, 9);
-        let password = password.filter(|pw| !pw.is_empty() && format.supports_password());
-        for path in &targets {
-            let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
-                continue;
-            };
-            let archive =
-                unique(&parent.join(format!("{}.{}", name.to_string_lossy(), format.extension())));
-            let mut legacy_zip_crypto = false;
-            let mut cmd;
-            match format {
-                CompressFormat::Zip => match (password, seven_zip()) {
-                    (Some(pw), Some(sz)) => {
-                        cmd = Proc::new(sz);
-                        cmd.arg("a")
-                            .arg("-tzip")
-                            .arg("-mem=AES256")
-                            .arg(format!("-mx={level}"))
-                            .arg(format!("-p{pw}"))
-                            .arg("-bd")
-                            .arg("--")
-                            .arg(&archive)
-                            .arg(name);
-                    }
-                    (Some(pw), None) => {
-                        legacy_zip_crypto = true;
-                        cmd = Proc::new("zip");
-                        cmd.arg("-r")
-                            .arg(format!("-{level}"))
-                            .arg("-P")
-                            .arg(pw)
-                            .arg(&archive)
-                            .arg(name);
-                    }
-                    (None, _) => {
-                        cmd = Proc::new("zip");
-                        cmd.arg("-r")
-                            .arg(format!("-{level}"))
-                            .arg(&archive)
-                            .arg(name);
-                    }
-                },
-                CompressFormat::SevenZip => {
-                    let Some(sz) = seven_zip() else {
-                        outcome.status = Some(
+    let level = level.clamp(1, 9);
+    let password = password.filter(|pw| !pw.is_empty() && format.supports_password());
+    for path in &targets {
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            continue;
+        };
+        let archive =
+            unique(&parent.join(format!("{}.{}", name.to_string_lossy(), format.extension())));
+        let mut legacy_zip_crypto = false;
+        let mut cmd;
+        match format {
+            CompressFormat::Zip => match (password, seven_zip()) {
+                (Some(pw), Some(sz)) => {
+                    cmd = Proc::new(sz);
+                    cmd.arg("a")
+                        .arg("-tzip")
+                        .arg("-mem=AES256")
+                        .arg(format!("-mx={level}"))
+                        .arg(format!("-p{pw}"))
+                        .arg("-bd")
+                        .arg("--")
+                        .arg(&archive)
+                        .arg(name);
+                }
+                (Some(pw), None) => {
+                    legacy_zip_crypto = true;
+                    cmd = Proc::new("zip");
+                    cmd.arg("-r")
+                        .arg(format!("-{level}"))
+                        .arg("-P")
+                        .arg(pw)
+                        .arg(&archive)
+                        .arg(name);
+                }
+                (None, _) => {
+                    cmd = Proc::new("zip");
+                    cmd.arg("-r")
+                        .arg(format!("-{level}"))
+                        .arg(&archive)
+                        .arg(name);
+                }
+            },
+            CompressFormat::SevenZip => {
+                let Some(sz) = seven_zip() else {
+                    outcome.status = Some(
                             "7-Zip (7z / 7zz / 7za) is not installed, so 7z archives cannot be created."
                                 .into(),
                         );
-                        break;
-                    };
-                    cmd = Proc::new(sz);
-                    cmd.arg("a").arg("-t7z").arg(format!("-mx={level}"));
-                    if let Some(pw) = password {
-                        // -mhe=on also encrypts the file names inside the archive.
-                        cmd.arg(format!("-p{pw}")).arg("-mhe=on");
-                    }
-                    cmd.arg("-bd").arg("--").arg(&archive).arg(name);
+                    break;
+                };
+                cmd = Proc::new(sz);
+                cmd.arg("a").arg("-t7z").arg(format!("-mx={level}"));
+                if let Some(pw) = password {
+                    // -mhe=on also encrypts the file names inside the archive.
+                    cmd.arg(format!("-p{pw}")).arg("-mhe=on");
                 }
-                CompressFormat::Tar => {
-                    cmd = Proc::new("tar");
-                    cmd.arg("-cf").arg(&archive).arg("-C").arg(parent).arg(name);
-                }
-                CompressFormat::Gzip
-                | CompressFormat::Xz
-                | CompressFormat::Zstd
-                | CompressFormat::Bzip2 => {
-                    let program = match format {
-                        CompressFormat::Gzip => "gzip",
-                        CompressFormat::Xz => "xz",
-                        CompressFormat::Bzip2 => "bzip2",
-                        _ => "zstd",
-                    };
-                    cmd = Proc::new("tar");
-                    cmd.arg(format!("--use-compress-program={program} -{level}"))
-                        .arg("-cf")
-                        .arg(&archive)
-                        .arg("-C")
-                        .arg(parent)
-                        .arg(name);
-                }
+                cmd.arg("-bd").arg("--").arg(&archive).arg(name);
             }
-            cmd.current_dir(parent).stdin(std::process::Stdio::null());
-            match cmd.output() {
-                Ok(done) if done.status.success() => {
-                    outcome.status = Some(if legacy_zip_crypto {
-                        format!(
-                            "Created {} (legacy ZipCrypto; install 7-Zip for AES-256)",
-                            archive.display()
-                        )
-                    } else if password.is_some() {
-                        format!("Created {} (password protected)", archive.display())
-                    } else {
-                        format!("Created {}", archive.display())
-                    });
-                    outcome.undo.push(UndoAction::Trash(archive.clone()));
-                }
-                Ok(done) => {
-                    // `archive` did not exist before this run, so a partial file is ours.
-                    let _ = fs::remove_file(&archive);
-                    outcome.status = Some(format!("Archive failed: {}", tail_message(&done)));
-                    break;
-                }
-                Err(error) => {
-                    outcome.status = Some(format!("Archive failed: {error}"));
-                    break;
-                }
+            CompressFormat::Tar => {
+                cmd = Proc::new("tar");
+                cmd.arg("-cf").arg(&archive).arg("-C").arg(parent).arg(name);
+            }
+            CompressFormat::Gzip
+            | CompressFormat::Xz
+            | CompressFormat::Zstd
+            | CompressFormat::Bzip2 => {
+                let program = match format {
+                    CompressFormat::Gzip => "gzip",
+                    CompressFormat::Xz => "xz",
+                    CompressFormat::Bzip2 => "bzip2",
+                    _ => "zstd",
+                };
+                cmd = Proc::new("tar");
+                cmd.arg(format!("--use-compress-program={program} -{level}"))
+                    .arg("-cf")
+                    .arg(&archive)
+                    .arg("-C")
+                    .arg(parent)
+                    .arg(name);
             }
         }
+        cmd.current_dir(parent).stdin(std::process::Stdio::null());
+        match cmd.output() {
+            Ok(done) if done.status.success() => {
+                outcome.status = Some(if legacy_zip_crypto {
+                    format!(
+                        "Created {} (legacy ZipCrypto; install 7-Zip for AES-256)",
+                        archive.display()
+                    )
+                } else if password.is_some() {
+                    format!("Created {} (password protected)", archive.display())
+                } else {
+                    format!("Created {}", archive.display())
+                });
+                outcome.undo.push(UndoAction::Trash(archive.clone()));
+            }
+            Ok(done) => {
+                // `archive` did not exist before this run, so a partial file is ours.
+                let _ = fs::remove_file(&archive);
+                outcome.status = Some(format!("Archive failed: {}", tail_message(&done)));
+                break;
+            }
+            Err(error) => {
+                outcome.status = Some(format!("Archive failed: {error}"));
+                break;
+            }
+        }
+    }
     outcome
 }
 
@@ -2659,10 +2659,7 @@ fn transfer_job(
         let target = if choice == ConflictChoice::Replace && wanted.exists() && wanted != *path {
             // The replaced item goes to the Trash so it stays recoverable.
             if let Err(error) = move_to_trash(&wanted) {
-                outcome.status = Some(format!(
-                    "Could not replace '{}': {error}",
-                    wanted.display()
-                ));
+                outcome.status = Some(format!("Could not replace '{}': {error}", wanted.display()));
                 break;
             }
             wanted
@@ -2748,65 +2745,66 @@ fn delete_job(origin: PathBuf, targets: Vec<PathBuf>, in_trash: bool) -> JobOutc
 }
 
 fn walk_search(root: &Path, needle: &str) -> (Vec<Entry>, bool) {
-        let mut found: Vec<Entry> = Vec::new();
-        let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
-        let mut truncated = false;
-        'walk: while let Some(dir) = stack.pop() {
-            let Ok(read) = fs::read_dir(&dir) else {
+    let mut found: Vec<Entry> = Vec::new();
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    let mut truncated = false;
+    'walk: while let Some(dir) = stack.pop() {
+        let Ok(read) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for item in read.flatten() {
+            let path = item.path();
+            let Ok(file_type) = item.file_type() else {
                 continue;
             };
-            for item in read.flatten() {
-                let path = item.path();
-                let Ok(file_type) = item.file_type() else {
-                    continue;
-                };
-                let is_dir = file_type.is_dir();
-                // A link to a folder is listed (and opens) as a folder, but is never walked
-                // into, so link loops still cannot occur.
-                let shown_as_dir = is_dir || (file_type.is_symlink() && path.is_dir());
-                let name = item.file_name().to_string_lossy().to_lowercase();
-                if name.contains(needle) {
-                    let mut e = Entry::new(
-                        &path,
-                        if shown_as_dir {
-                            EntryKind::Folder
-                        } else {
-                            EntryKind::File
-                        },
-                    );
-                    if let Ok(metadata) = item.metadata() {
-                        if !shown_as_dir {
-                            e.size = metadata.len();
-                        }
-                        e.modified = metadata.modified().ok();
-                    }
+            let is_dir = file_type.is_dir();
+            // A link to a folder is listed (and opens) as a folder, but is never walked
+            // into, so link loops still cannot occur.
+            let shown_as_dir = is_dir || (file_type.is_symlink() && path.is_dir());
+            let name = item.file_name().to_string_lossy().to_lowercase();
+            if name.contains(needle) {
+                let mut e = Entry::new(
+                    &path,
+                    if shown_as_dir {
+                        EntryKind::Folder
+                    } else {
+                        EntryKind::File
+                    },
+                );
+                if let Ok(metadata) = item.metadata() {
                     if !shown_as_dir {
-                        e.type_name = fm_mime::guess(&path).type_name;
+                        e.size = metadata.len();
                     }
-                    found.push(e);
-                    if found.len() >= SEARCH_LIMIT {
-                        truncated = true;
-                        break 'walk;
-                    }
+                    e.modified = metadata.modified().ok();
                 }
-                // `file_type()` does not follow symlinks, so link loops cannot occur.
-                if is_dir {
-                    stack.push(path);
+                if !shown_as_dir {
+                    e.type_name = fm_mime::guess(&path).type_name;
+                }
+                found.push(e);
+                if found.len() >= SEARCH_LIMIT {
+                    truncated = true;
+                    break 'walk;
                 }
             }
+            // `file_type()` does not follow symlinks, so link loops cannot occur.
+            if is_dir {
+                stack.push(path);
+            }
         }
+    }
     (found, truncated)
 }
 
 fn tool_exists(name: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|dir| dir.join(name).is_file())
-    })
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
 }
 
 /// The 7-Zip command line tool, whichever way it is packaged.
 fn seven_zip() -> Option<&'static str> {
-    ["7zz", "7z", "7za"].into_iter().find(|name| tool_exists(name))
+    ["7zz", "7z", "7za"]
+        .into_iter()
+        .find(|name| tool_exists(name))
 }
 
 fn output_text(out: &std::process::Output) -> String {
@@ -2871,9 +2869,14 @@ fn extract_archive(
         .to_owned();
 
     // A lone compressed file (file.txt.gz), as opposed to a tar archive.
-    let single = [(".gz", "gzip"), (".xz", "xz"), (".bz2", "bzip2"), (".zst", "zstd")]
-        .into_iter()
-        .find(|&(ext, _)| lower.ends_with(ext) && !lower.ends_with(&format!(".tar{ext}")));
+    let single = [
+        (".gz", "gzip"),
+        (".xz", "xz"),
+        (".bz2", "bzip2"),
+        (".zst", "zstd"),
+    ]
+    .into_iter()
+    .find(|&(ext, _)| lower.ends_with(ext) && !lower.ends_with(&format!(".tar{ext}")));
     if let Some((_, program)) = single {
         if !tool_exists(program) {
             return Err(fail(format!("{program} is not installed")));

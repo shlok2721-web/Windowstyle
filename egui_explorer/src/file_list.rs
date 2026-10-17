@@ -1154,7 +1154,10 @@ fn item_menu(in_trash: bool, has_archive: bool) -> Vec<MenuEntry> {
         M::Sep,
         M::item("Pin to Quick access", C::PinToQuickAccess).icon(I::Pin),
         M::item("Compress to tar.xz", C::Compress).icon(I::Compress),
-        M::item("Compress to ZIP", C::CompressAs(crate::CompressFormat::Zip, 6)),
+        M::item(
+            "Compress to ZIP",
+            C::CompressAs(crate::CompressFormat::Zip, 6),
+        ),
         M::item("Compress to...", C::ShowCompressOptions),
         M::item("Share", C::Share).icon(I::Share),
         M::Sep,
@@ -1178,7 +1181,15 @@ fn item_menu(in_trash: bool, has_archive: bool) -> Vec<MenuEntry> {
         // Right after the "Compress to..." entries.
         let at = v
             .iter()
-            .position(|e| matches!(e, M::Item { cmd: C::ShowCompressOptions, .. }))
+            .position(|e| {
+                matches!(
+                    e,
+                    M::Item {
+                        cmd: C::ShowCompressOptions,
+                        ..
+                    }
+                )
+            })
             .map_or(1, |i| i + 1);
         v.insert(at, M::item("Extract here", C::ExtractHere).icon(I::Extract));
         v.insert(at + 1, M::item("Extract to folder", C::Extract));
