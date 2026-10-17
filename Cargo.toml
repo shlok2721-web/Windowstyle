@@ -1,0 +1,20 @@
+[workspace]
+resolver = "3"
+members = [
+    "egui_explorer",
+    "fm_app",
+    "fm_crates/fm_behav",
+    "fm_crates/fm_lifecycle",
+    "fm_crates/fm_mime",
+    "fm_crates/fm_notify",
+    "fm_crates/fm_persist",
+    "fm_crates/fm_settings",
+    "fm_crates/fm_thumbs",
+    "fm_crates/fm_tiers",
+    "fm_crates/fm_trash",
+    "fm_crates/fm_walk",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"

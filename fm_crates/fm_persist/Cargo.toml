@@ -1,0 +1,9 @@
+[package]
+name = "fm_persist"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "One small atomic state file: hash-skipped writes, a rare/batched flush policy and a bytes-written counter. std only."
+
+[dev-dependencies]
+tempfile = "3"

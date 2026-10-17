@@ -1,0 +1,79 @@
+name: Rust CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install native GUI build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libgl1-mesa-dev
+
+      - name: Format Rust code
+        run: cargo fmt --all
+
+      - name: Commit formatting fixes
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          git diff --name-only -z -- '*.rs' | xargs -0 -r git add --
+          if ! git diff --cached --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "Apply Rust formatting"
+            git push origin HEAD:main
+          fi
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check all targets
+        run: cargo check --workspace --all-targets
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+
+      - name: Test all crates and targets
+        run: cargo test --workspace --all-targets
+
+      - name: Build application release binary
+        run: cargo build --release -p fm_app
+
+      - name: Upload release executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: windowstyle-linux-x86_64
+          path: target/release/file-manager
+          if-no-files-found: error
+          retention-days: 14
