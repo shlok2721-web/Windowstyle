@@ -1,0 +1,9 @@
+[package]
+name = "fm_lifecycle"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Process lifecycle hooks: SIGTERM/SIGHUP/SIGINT and systemd-logind suspend/shutdown notifications (with a delay inhibitor), delivered as plain events. No unsafe code in this crate."
+
+[dependencies]
+signal-hook = "0.3.18"
