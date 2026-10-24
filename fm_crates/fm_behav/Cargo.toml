@@ -1,0 +1,9 @@
+[package]
+name = "fm_behav"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Behaviour mapping in RAM: a 16-byte event ring folded into bounded aggregates (frecency, next-folder table, pins, tier scores) with a deterministic text encoding. No I/O."
+
+[dependencies]
+fm_tiers = { path = "../fm_tiers" }
