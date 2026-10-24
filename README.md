@@ -287,6 +287,19 @@ To replace an icon, place a valid PNG in that file and rename it to remove the `
 - Search covers the current folder and its subfolders: `plocate` first, then `find`, then "Not found". "Build index" opens a terminal running `sudo updatedb`.
 
 ---
+## Intellectual Property and Third-Party Concerns
+
+Windowstyle is an independent, community-developed file manager for Linux. It is not affiliated with, endorsed by, or sponsored by Microsoft.
+
+The project aims to provide a familiar file-management experience for users transitioning from Windows to Linux. Certain interface elements or visual assets may resemble those found in other operating systems.
+
+If you are a rights holder or an authorized representative and believe that any icon, image, visual asset, or other material distributed with Windowstyle infringes your intellectual property rights, please contact the repository owner through [GitHub Issues](https://github.com/shlok2721-web/Windowstyle/issues).
+
+I take intellectual property concerns seriously and will review legitimate reports promptly. Where appropriate, disputed material will be removed or replaced to address the concern.
+
+This statement does not claim ownership of third-party intellectual property, imply authorization to use third-party assets, or waive any rights available to their respective owners.
+
+---
 
 ## License
 
