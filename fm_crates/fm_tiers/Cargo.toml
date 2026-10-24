@@ -1,0 +1,9 @@
+[package]
+name = "fm_tiers"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Hot/warm/cold attention tiers for directory listings: RAM-only caches validated by directory mtime, a deny list, and hysteresis-based promotion. No UI and no writes."
+
+[dev-dependencies]
+tempfile = "3"

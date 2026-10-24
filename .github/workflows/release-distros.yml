@@ -1,0 +1,287 @@
+name: Release Build (Linux distributions)
+
+# Builds one fat-LTO binary per major distribution, natively inside that distro's
+# container (its own glibc, linker and C toolchain). Arch/Manjaro/EndeavourOS keep
+# using the separate "Release Build (x86_64-linux-gnu)" workflow.
+#
+# Mint, Pop!_OS, Zorin, elementary -> use the matching Ubuntu build.
+# AlmaLinux / RHEL                 -> use the matching Rocky build.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build, exactly as it appears in Tags (e.g. v1.0.0). Run the workflow from the main branch.'
+        required: true
+        default: 'v1.0.0'
+      cpu_level:
+        description: 'CPU baseline. generic runs everywhere; v3 needs AVX2 (Intel 2013+/AMD Zen)'
+        type: choice
+        default: generic
+        options:
+          - generic
+          - x86-64-v2
+          - x86-64-v3
+      publish:
+        description: 'Attach the archives to the GitHub Release for this tag'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-distros-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+  # Pin an exact version (e.g. "1.93.0") for reproducible releases.
+  # Must be >= 1.85 (edition 2024 / resolver 3).
+  RUST_TOOLCHAIN: stable
+
+jobs:
+  # Makes sure Cargo.lock matches the workspace BEFORE the expensive builds start.
+  # If it is out of sync, the lock is repaired here and shared with every build leg.
+  preflight:
+    name: Preflight (tag and Cargo.lock)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write   # only used to push the repaired Cargo.lock to main (best effort)
+    outputs:
+      fixed: ${{ steps.lock.outputs.fixed }}
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Install Rust
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+
+      - name: Validate or repair Cargo.lock
+        id: lock
+        run: |
+          set -euo pipefail
+          CARGO="cargo +$RUST_TOOLCHAIN"
+
+          if $CARGO metadata --locked --format-version 1 > /dev/null 2>&1; then
+            echo "Cargo.lock is in sync."
+            echo "fixed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "::warning title=Cargo.lock out of sync::Repairing Cargo.lock for this build."
+          # Preferred: only re-sync workspace crates; third-party versions stay as locked.
+          $CARGO update --workspace || true
+
+          if ! $CARGO metadata --locked --format-version 1 > /dev/null 2>&1; then
+            echo "::warning::'cargo update --workspace' was not enough; regenerating the full lockfile (dependency versions may change)."
+            $CARGO generate-lockfile
+          fi
+
+          $CARGO metadata --locked --format-version 1 > /dev/null
+          echo "fixed=true" >> "$GITHUB_OUTPUT"
+          {
+            echo '### Cargo.lock was repaired by this run'
+            echo 'The tag contained an out-of-sync Cargo.lock. Builds used the repaired file.'
+            echo '```diff'
+            git diff --stat -- Cargo.lock || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Share repaired Cargo.lock with the build jobs
+        if: steps.lock.outputs.fixed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fixed-cargo-lock
+          path: Cargo.lock
+          if-no-files-found: error
+          retention-days: 7
+
+      # Best effort: also fix main so future runs/CI do not need the repair.
+      # The tag itself is NOT moved or rewritten.
+      - name: Push repaired Cargo.lock to main
+        if: steps.lock.outputs.fixed == 'true'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          cp Cargo.lock "$RUNNER_TEMP/Cargo.lock.fixed"
+          git fetch origin main
+          git checkout -f -B main origin/main
+          cp "$RUNNER_TEMP/Cargo.lock.fixed" Cargo.lock
+          if cargo "+$RUST_TOOLCHAIN" metadata --locked --format-version 1 > /dev/null 2>&1 \
+             && ! git diff --quiet -- Cargo.lock; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add Cargo.lock
+            git commit -m "ci: repair Cargo.lock for release $TAG"
+            git push origin HEAD:main
+          else
+            echo "main does not need this lock, or it does not fit main; skipping."
+          fi
+
+  build:
+    name: Build ${{ matrix.id }}
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    # Experimental legs may fail without failing the whole run.
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { id: ubuntu-22.04,          image: "ubuntu:22.04",                 family: debian,   experimental: false }
+          - { id: ubuntu-24.04,          image: "ubuntu:24.04",                 family: debian,   experimental: false }
+          - { id: ubuntu-26.04,          image: "ubuntu:26.04",                 family: debian,   experimental: true  }
+          - { id: debian-12,             image: "debian:bookworm",              family: debian,   experimental: false }
+          - { id: debian-13,             image: "debian:trixie",                family: debian,   experimental: false }
+          - { id: fedora,                image: "fedora:latest",                family: fedora,   experimental: false }
+          - { id: rocky-9,               image: "rockylinux:9",                 family: rhel,     experimental: false }
+          - { id: rocky-10,              image: "rockylinux/rockylinux:10",      family: rhel,     experimental: true  }
+          - { id: opensuse-tumbleweed,   image: "opensuse/tumbleweed:latest",   family: opensuse, experimental: false }
+
+    steps:
+      # Source code comes from the release tag...
+      - name: Checkout release tag (source)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+          path: src
+
+      # ...but the build script comes from the branch the workflow was started on,
+      # so it works even if the tag was created before the script existed.
+      - name: Checkout build script
+        uses: actions/checkout@v4
+        with:
+          path: ci
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+
+      # If the preflight had to repair Cargo.lock, every build uses the repaired file.
+      - name: Download repaired Cargo.lock
+        if: needs.preflight.outputs.fixed == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: fixed-cargo-lock
+          path: src
+
+      - name: Resolve CPU baseline
+        env:
+          CPU_LEVEL: ${{ inputs.cpu_level }}
+        run: |
+          case "${CPU_LEVEL:-generic}" in
+            generic)   echo "RUSTFLAGS_EXTRA=" >> "$GITHUB_ENV"; echo "CPU_SUFFIX=" >> "$GITHUB_ENV" ;;
+            x86-64-v2) echo "RUSTFLAGS_EXTRA=-C target-cpu=x86-64-v2" >> "$GITHUB_ENV"; echo "CPU_SUFFIX=-v2" >> "$GITHUB_ENV" ;;
+            x86-64-v3) echo "RUSTFLAGS_EXTRA=-C target-cpu=x86-64-v3" >> "$GITHUB_ENV"; echo "CPU_SUFFIX=-v3" >> "$GITHUB_ENV" ;;
+            *) echo "Unknown cpu_level: $CPU_LEVEL" >&2; exit 1 ;;
+          esac
+
+      # Cache only downloaded crates, never target/ (fat-LTO output is huge and
+      # would exhaust the repository cache quota).
+      - name: Restore Cargo registry cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ runner.temp }}/cache/${{ matrix.id }}/registry
+            ${{ runner.temp }}/cache/${{ matrix.id }}/git
+          key: cargo-${{ matrix.id }}-${{ hashFiles('src/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ matrix.id }}-
+
+      - name: Build release binary inside the target distro
+        env:
+          DISTRO_ID: ${{ matrix.id }}
+          DISTRO_FAMILY: ${{ matrix.family }}
+          CONTAINER_IMAGE: ${{ matrix.image }}
+          ASSET_NAME: file-manager-${{ env.TAG }}-linux-${{ matrix.id }}-x86_64${{ env.CPU_SUFFIX }}
+          COMMIT_SHA: ${{ github.sha }}
+          RELEASE_REF: ${{ env.TAG }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CACHE="$RUNNER_TEMP/cache/$DISTRO_ID"
+          mkdir -p "$CACHE/registry" "$CACHE/git" "$GITHUB_WORKSPACE/src/dist/$DISTRO_ID"
+
+          docker run --rm --pull=missing --platform linux/amd64 \
+            -e DISTRO_ID -e DISTRO_FAMILY -e CONTAINER_IMAGE -e ASSET_NAME \
+            -e RUSTFLAGS_EXTRA -e COMMIT_SHA -e RELEASE_REF \
+            -e RUST_TOOLCHAIN="$RUST_TOOLCHAIN" \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            -e CARGO_HOME=/cargo \
+            -e RUSTUP_HOME=/rustup \
+            -e CARGO_TARGET_DIR=/tmp/target \
+            -e CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse \
+            -e CARGO_NET_RETRY=10 \
+            -e CARGO_TERM_COLOR=never \
+            -v "$GITHUB_WORKSPACE/src:/src" \
+            -v "$GITHUB_WORKSPACE/ci/.github/scripts:/ci:ro" \
+            -v "$CACHE/registry:/cargo/registry" \
+            -v "$CACHE/git:/cargo/git" \
+            -w /src \
+            "$CONTAINER_IMAGE" /bin/sh /ci/build-in-container.sh </dev/null
+
+          test -s "src/dist/$DISTRO_ID/${ASSET_NAME}.tar.gz"
+
+      - name: Upload this build's archive
+        if: always() && !cancelled() && hashFiles(format('src/dist/{0}/*.tar.gz', matrix.id)) != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: windowstyle-distro-${{ matrix.id }}
+          path: src/dist/${{ matrix.id }}/*.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+  publish:
+    name: Collect archives and publish
+    needs: build
+    # Collect whatever was built, even if some legs failed.
+    if: always() && !cancelled() && needs.build.result != 'skipped' && (github.event_name == 'push' || inputs.publish)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download every archive that was built
+        uses: actions/download-artifact@v4
+        with:
+          pattern: windowstyle-distro-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify archives and create checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+
+          if ! compgen -G '*.tar.gz' > /dev/null; then
+            echo 'No archives were built; refusing to publish an empty release.' >&2
+            exit 1
+          fi
+
+          for f in *.tar.gz; do
+            tar -tzf "$f" | grep -qx 'file-manager' \
+              || { echo "$f does not contain the file-manager executable" >&2; exit 1; }
+          done
+
+          sha256sum *.tar.gz > SHA256SUMS-distros.txt
+          {
+            echo '### Built archives'
+            sed 's/^/    /' SHA256SUMS-distros.txt
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attach archives to the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          files: |
+            release-assets/*.tar.gz
+            release-assets/SHA256SUMS-distros.txt
+          fail_on_unmatched_files: true
+          generate_release_notes: true

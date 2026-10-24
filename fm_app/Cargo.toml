@@ -1,0 +1,25 @@
+[package]
+name = "fm_app"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "file-manager"
+path = "src/main.rs"
+
+[dependencies]
+egui = "0.37.0"
+arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"] }
+dirs = "7.0.0"
+eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+egui_explorer = { path = "../egui_explorer" }
+fm_behav = { path = "../fm_crates/fm_behav" }
+fm_lifecycle = { path = "../fm_crates/fm_lifecycle" }
+fm_mime = { path = "../fm_crates/fm_mime" }
+fm_notify = { path = "../fm_crates/fm_notify" }
+fm_persist = { path = "../fm_crates/fm_persist" }
+fm_settings = { path = "../fm_crates/fm_settings" }
+fm_thumbs = { path = "../fm_crates/fm_thumbs" }
+fm_tiers = { path = "../fm_crates/fm_tiers" }
+fm_trash = { path = "../fm_crates/fm_trash" }
