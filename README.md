@@ -8,7 +8,7 @@
 A fast, lightweight file manager with the ribbon, breadcrumb bar and layout you already know,<br>
 built for Linux desktops and careful with your disk.
 </p>
-![Windowstyle main window](screenshots/main-window.png)
+
 <p>
 <img alt="Platform" src="https://img.shields.io/badge/platform-Linux%20x86--64-1f2328?style=flat-square">
 <img alt="Display server" src="https://img.shields.io/badge/display-X11%20%7C%20Wayland-1f2328?style=flat-square">
@@ -55,6 +55,8 @@ Listings and search live in memory. State is saved as one small text file, and o
 </td>
 </tr>
 </table>
+
+![Windowstyle main window](screenshots/main-window.png)
 
 ---
 
