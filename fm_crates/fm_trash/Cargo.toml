@@ -1,0 +1,15 @@
+[package]
+name = "fm_trash"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Freedesktop.org Trash spec 1.0: move files to the trash, list, restore, purge, empty. No unsafe, no egui dependency."
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1", default-features = false, features = ["std", "fs", "process"] }
+
+[dev-dependencies]
+tempfile = "3"

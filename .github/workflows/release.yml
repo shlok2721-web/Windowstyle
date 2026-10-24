@@ -1,0 +1,102 @@
+name: Release Build (x86_64-linux-gnu)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build from (select this tag as the Run workflow ref too)'
+        required: true
+        default: 'v1.0.0-beta'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Max-optimization (fat LTO) builds can run long; raise the ceiling well above normal.
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag }}
+
+      - name: Purge any stale cache / previous build output
+        run: |
+          rm -rf ~/.cargo/registry
+          rm -rf ~/.cargo/git
+          rm -rf target
+          cargo clean || true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Sanity-check release profile in Cargo.toml
+        run: |
+          if ! grep -q 'profile.release' Cargo.toml; then
+            echo "::warning::No [profile.release] section found in Cargo.toml. Expected lto=\"fat\", codegen-units=1, strip=true, panic=\"abort\" for max optimization."
+          fi
+
+      - name: Validate or regenerate Cargo.lock
+        id: lock
+        run: |
+          set -e
+          if cargo metadata --locked --format-version=1 > /dev/null 2>&1; then
+            echo "Cargo.lock is valid and in sync with Cargo.toml."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Cargo.lock missing or out of sync — regenerating."
+            cargo generate-lockfile
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit regenerated Cargo.lock back to the tag
+        if: steps.lock.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock
+          git commit -m "ci: regenerate Cargo.lock for release build [skip ci]"
+          git push origin HEAD:refs/tags/${{ github.event.inputs.tag }} --force
+
+      - name: Build fm_app release binary (now-validated lockfile)
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu -p fm_app
+
+      - name: Discover actual binary name(s) produced by fm_app
+        id: bins
+        run: |
+          set -e
+          NAMES=$(cargo metadata --no-deps --locked --format-version=1 \
+            | jq -r '.packages[] | select(.name=="fm_app") | .targets[] | select(.kind[]=="bin") | .name')
+          if [ -z "$NAMES" ]; then
+            echo "::error::Package fm_app defines no [[bin]] target — nothing to zip. Is fm_app a library crate?"
+            exit 1
+          fi
+          echo "Binaries found: $NAMES"
+          echo "names<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$NAMES" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: List release directory (debug aid if a path is ever wrong again)
+        run: ls -la target/x86_64-unknown-linux-gnu/release/
+
+      - name: Package binary/binaries into zip
+        run: |
+          mkdir -p dist
+          cd dist
+          while IFS= read -r BIN_NAME; do
+            [ -z "$BIN_NAME" ] && continue
+            cp "../target/x86_64-unknown-linux-gnu/release/${BIN_NAME}" .
+          done <<< "${{ steps.bins.outputs.names }}"
+          zip "fm_app-${{ github.event.inputs.tag }}-x86_64-linux-gnu.zip" $(echo "${{ steps.bins.outputs.names }}" | tr '\n' ' ')
+
+      - name: Upload zipped binary as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fm_app-${{ github.event.inputs.tag }}-x86_64-linux-gnu
+          path: dist/*.zip
+          retention-days: 30
