@@ -44,8 +44,89 @@ env:
   RUST_TOOLCHAIN: stable
 
 jobs:
+  # Makes sure Cargo.lock matches the workspace BEFORE the expensive builds start.
+  # If it is out of sync, the lock is repaired here and shared with every build leg.
+  preflight:
+    name: Preflight (tag and Cargo.lock)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write   # only used to push the repaired Cargo.lock to main (best effort)
+    outputs:
+      fixed: ${{ steps.lock.outputs.fixed }}
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Install Rust
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+
+      - name: Validate or repair Cargo.lock
+        id: lock
+        run: |
+          set -euo pipefail
+          CARGO="cargo +$RUST_TOOLCHAIN"
+
+          if $CARGO metadata --locked --format-version 1 > /dev/null 2>&1; then
+            echo "Cargo.lock is in sync."
+            echo "fixed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "::warning title=Cargo.lock out of sync::Repairing Cargo.lock for this build."
+          # Preferred: only re-sync workspace crates; third-party versions stay as locked.
+          $CARGO update --workspace || true
+
+          if ! $CARGO metadata --locked --format-version 1 > /dev/null 2>&1; then
+            echo "::warning::'cargo update --workspace' was not enough; regenerating the full lockfile (dependency versions may change)."
+            $CARGO generate-lockfile
+          fi
+
+          $CARGO metadata --locked --format-version 1 > /dev/null
+          echo "fixed=true" >> "$GITHUB_OUTPUT"
+          {
+            echo '### Cargo.lock was repaired by this run'
+            echo 'The tag contained an out-of-sync Cargo.lock. Builds used the repaired file.'
+            echo '```diff'
+            git diff --stat -- Cargo.lock || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Share repaired Cargo.lock with the build jobs
+        if: steps.lock.outputs.fixed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fixed-cargo-lock
+          path: Cargo.lock
+          if-no-files-found: error
+          retention-days: 7
+
+      # Best effort: also fix main so future runs/CI do not need the repair.
+      # The tag itself is NOT moved or rewritten.
+      - name: Push repaired Cargo.lock to main
+        if: steps.lock.outputs.fixed == 'true'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          cp Cargo.lock "$RUNNER_TEMP/Cargo.lock.fixed"
+          git fetch origin main
+          git checkout -f -B main origin/main
+          cp "$RUNNER_TEMP/Cargo.lock.fixed" Cargo.lock
+          if cargo "+$RUST_TOOLCHAIN" metadata --locked --format-version 1 > /dev/null 2>&1 \
+             && ! git diff --quiet -- Cargo.lock; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add Cargo.lock
+            git commit -m "ci: repair Cargo.lock for release $TAG"
+            git push origin HEAD:main
+          else
+            echo "main does not need this lock, or it does not fit main; skipping."
+          fi
+
   build:
     name: Build ${{ matrix.id }}
+    needs: preflight
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     # Experimental legs may fail without failing the whole run.
@@ -80,6 +161,14 @@ jobs:
           path: ci
           sparse-checkout: .github/scripts
           sparse-checkout-cone-mode: false
+
+      # If the preflight had to repair Cargo.lock, every build uses the repaired file.
+      - name: Download repaired Cargo.lock
+        if: needs.preflight.outputs.fixed == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: fixed-cargo-lock
+          path: src
 
       - name: Resolve CPU baseline
         env:
@@ -153,7 +242,7 @@ jobs:
     name: Collect archives and publish
     needs: build
     # Collect whatever was built, even if some legs failed.
-    if: always() && !cancelled() && (github.event_name == 'push' || inputs.publish)
+    if: always() && !cancelled() && needs.build.result != 'skipped' && (github.event_name == 'push' || inputs.publish)
     runs-on: ubuntu-24.04
     permissions:
       contents: write

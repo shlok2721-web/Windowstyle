@@ -30,7 +30,7 @@ case "$DISTRO_FAMILY" in
     dnf -y install --allowerasing \
       ca-certificates curl file git tar gzip binutils gcc gcc-c++ make pkgconf-pkg-config \
       libxkbcommon-devel libxkbcommon-x11-devel wayland-devel \
-      libX11-devel libX11-xcb-devel libxcb-devel libXrandr-devel \
+      libX11-devel libxcb-devel libXrandr-devel \
       libXcursor-devel libXi-devel libXinerama-devel libXext-devel \
       libXrender-devel libXfixes-devel mesa-libGL-devel systemd-devel \
       openssl-devel
@@ -43,7 +43,7 @@ case "$DISTRO_FAMILY" in
     dnf -y install --allowerasing \
       ca-certificates curl file git tar gzip binutils gcc gcc-c++ make pkgconf-pkg-config \
       libxkbcommon-devel libxkbcommon-x11-devel wayland-devel \
-      libX11-devel libX11-xcb-devel libxcb-devel libXrandr-devel \
+      libX11-devel libxcb-devel libXrandr-devel \
       libXcursor-devel libXi-devel libXinerama-devel libXext-devel \
       libXrender-devel libXfixes-devel mesa-libGL-devel systemd-devel \
       openssl-devel
