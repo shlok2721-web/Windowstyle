@@ -265,9 +265,13 @@ jobs:
             exit 1
           fi
 
+          # Accept "file-manager" at the top level OR nested one or more
+          # directories deep (tar sometimes stores entries as "./file-manager"
+          # or "<asset-name>/file-manager"), as long as the entry's basename
+          # matches exactly.
           for f in *.tar.gz; do
-            tar -tzf "$f" | grep -qx 'file-manager' \
-              || { echo "$f does not contain the file-manager executable" >&2; exit 1; }
+            tar -tzf "$f" | sed 's#^\./##' | grep -qE '(^|/)file-manager$' \
+              || { echo "$f does not contain the file-manager executable" >&2; echo "--- contents of $f ---" >&2; tar -tzf "$f" >&2; exit 1; }
           done
 
           sha256sum *.tar.gz > SHA256SUMS-distros.txt
@@ -278,6 +282,8 @@ jobs:
 
       - name: Attach archives to the GitHub Release
         uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ env.TAG }}
           files: |
