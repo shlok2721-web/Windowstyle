@@ -1,0 +1,18 @@
+[package]
+name = "egui_explorer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+egui = "0.37.0"
+fm_thumbs = { path = "../fm_crates/fm_thumbs" }
+resvg = { version = "0.45", default-features = false }
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+# Reliable system-clipboard *text* reads for every TextEdit (address bar, search box,
+# rename, ...): egui-winit's own paste path is unreliable on the same Wayland setups that
+# already needed arboard for copying (see fm_app's `copy_text_to_clipboard`).
+arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"] }
+
+[dev-dependencies]
+dirs = "7.0.0"
+eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
