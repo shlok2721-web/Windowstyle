@@ -1,0 +1,93 @@
+name: Publish Existing Build Artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "GitHub Actions run ID containing the already-built artifacts"
+        required: true
+        type: string
+        default: "40456679673"
+      tag:
+        description: "Existing Git tag/release to publish"
+        required: true
+        type: string
+        default: "v1.0.2"
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish:
+    name: Download and publish existing artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check available artifacts from the failed run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.run_id }}
+        shell: bash
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/artifacts" \
+            --paginate \
+            --jq '.artifacts[] | select(.expired == false) | [.id, .name, (.size_in_bytes|tostring)] | @tsv' \
+            > "$RUNNER_TEMP/artifacts.tsv"
+
+          if [ ! -s "$RUNNER_TEMP/artifacts.tsv" ]; then
+            echo "::error::No unexpired artifacts were found for run ${RUN_ID}. The build may have failed before uploading artifacts."
+            false
+          fi
+
+          echo "Artifacts available from run ${RUN_ID}:"
+          cat "$RUNNER_TEMP/artifacts.tsv"
+
+      - name: Download existing artifacts (no build)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.run_id }}
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/release-artifacts"
+          gh run download "$RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$RUNNER_TEMP/release-artifacts"
+
+          find "$RUNNER_TEMP/release-artifacts" -type f -print
+
+          if ! find "$RUNNER_TEMP/release-artifacts" -type f -print -quit | grep -q .; then
+            echo "::error::The run had artifact metadata, but no files were downloaded."
+            false
+          fi
+
+      - name: Create release if needed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Windowstyle $TAG" \
+              --generate-notes \
+              --verify-tag
+          fi
+
+      - name: Upload every downloaded artifact file
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          while IFS= read -r -d '' file; do
+            parent="$(basename "$(dirname "$file")")"
+            base="$(basename "$file")"
+            asset="${parent}-${base}"
+            echo "Uploading: $asset"
+            gh release upload "$TAG" "$file#$asset" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          done < <(find "$RUNNER_TEMP/release-artifacts" -type f -print0)
+
+          echo "Published existing artifacts to release $TAG."
