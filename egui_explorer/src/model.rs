@@ -666,6 +666,90 @@ pub struct Column {
     pub visible: bool,
 }
 
+/// A name search pattern: plain text matches as a substring; `*` is a wildcard (`levi*mkv`
+/// finds names containing "levi" and, later in the name, "mkv"); `\*` is a literal `*`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NamePattern {
+    /// Lower-cased literal pieces that must appear in this order.
+    pieces: Vec<String>,
+}
+
+impl NamePattern {
+    pub fn parse(text: &str) -> Self {
+        let mut pieces = Vec::new();
+        let mut cur = String::new();
+        let mut chars = text.to_lowercase().chars().collect::<Vec<_>>().into_iter().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' if chars.peek() == Some(&'*') => {
+                    cur.push('*');
+                    chars.next();
+                }
+                '*' => {
+                    if !cur.is_empty() {
+                        pieces.push(std::mem::take(&mut cur));
+                    }
+                }
+                c => cur.push(c),
+            }
+        }
+        if !cur.is_empty() {
+            pieces.push(cur);
+        }
+        Self { pieces }
+    }
+
+    /// `name_lc` (already lower-case) contains every piece, in order.
+    pub fn matches(&self, name_lc: &str) -> bool {
+        let mut rest = name_lc;
+        for piece in &self.pieces {
+            match rest.find(piece.as_str()) {
+                Some(at) => rest = &rest[at + piece.len()..],
+                None => return false,
+            }
+        }
+        true
+    }
+
+    /// The text the name should start with to rank first (the first literal piece).
+    pub fn first(&self) -> &str {
+        self.pieces.first().map(String::as_str).unwrap_or("")
+    }
+
+    /// The longest literal run free of glob characters: a good, index-friendly substring
+    /// to hand to `plocate`, whose results are then checked with `matches`.
+    pub fn index_term(&self) -> Option<String> {
+        self.pieces
+            .iter()
+            .flat_map(|p| p.split(['*', '?', '[', ']', '\\']))
+            .max_by_key(|s| s.chars().count())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    }
+
+    /// A `find -iname` glob: `*piece*piece*`, with glob characters in the pieces escaped.
+    pub fn glob(&self) -> String {
+        let mut out = String::from("*");
+        for piece in &self.pieces {
+            for c in piece.chars() {
+                if matches!(c, '*' | '?' | '[' | ']' | '\\') {
+                    out.push('\\');
+                }
+                out.push(c);
+            }
+            out.push('*');
+        }
+        out
+    }
+}
+
+/// Quick access shows at most this many recent folders (two rows of eight)...
+pub const QA_MAX_FOLDERS: usize = 16;
+/// ...and at most this many recent files.
+pub const QA_MAX_FILES: usize = 30;
+/// Folder columns in Quick access; the cell width scales so exactly this many fit.
+pub const QA_FOLDER_COLS: usize = 8;
+
 /// Which entries the item pane lists. Only the Quick access history view narrows it: it
 /// draws its folders and its files as two panes, each with a different view mode.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -715,6 +799,8 @@ pub struct ExplorerState {
     history_stash: Option<Box<ViewStash>>,
     /// Narrows the listing to folders or files (set only while the history panes are drawn).
     pub scope: ListScope,
+    /// Quick access only: cell size override for the folder grid (so 8 columns always fit).
+    pub qa_cell: Option<(f32, f32)>,
     // --- selection ---
     pub selection: HashSet<PathBuf>,
     pub focus: Option<PathBuf>,
@@ -826,6 +912,7 @@ impl Default for ExplorerState {
             folders_first: true,
             history_stash: None,
             scope: ListScope::All,
+            qa_cell: None,
             selection: HashSet::new(),
             focus: None,
             anchor: None,
@@ -1163,9 +1250,26 @@ impl ExplorerState {
         }
     }
 
-    /// The uncached filter + sort. Only called from `refresh_order`.
+    /// The uncached filter + sort, trimmed in Quick access to the most recent items
+    /// (16 folders, 30 files). Only called from `refresh_order`.
     fn compute_order(&self) -> Vec<usize> {
+        let mut order = self.compute_order_all();
+        if self.in_quick_access() && !self.search_active {
+            let cap = match self.scope {
+                ListScope::FoldersOnly => Some(QA_MAX_FOLDERS),
+                ListScope::FilesOnly => Some(QA_MAX_FILES),
+                ListScope::All => None,
+            };
+            if let Some(cap) = cap {
+                order.truncate(cap);
+            }
+        }
+        order
+    }
+
+    fn compute_order_all(&self) -> Vec<usize> {
         let needle = self.search_text.to_lowercase();
+        let pattern = NamePattern::parse(&self.search_text);
         let mut indices: Vec<usize> = self
             .entries
             .iter()
@@ -1176,7 +1280,7 @@ impl ExplorerState {
                 ListScope::FoldersOnly => e.is_dir(),
                 ListScope::FilesOnly => !e.is_dir(),
             })
-            .filter(|(_, e)| needle.is_empty() || e.name_lc.contains(&needle))
+            .filter(|(_, e)| needle.is_empty() || pattern.matches(&e.name_lc))
             .map(|(i, _)| i)
             .collect();
         if self.search_active {

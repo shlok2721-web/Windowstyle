@@ -387,6 +387,16 @@ fn grid_for(v: ViewMode) -> Option<Grid> {
     })
 }
 
+/// `grid_for`, but honouring the Quick access folder-grid override (cell scaled to the pane).
+fn grid_of(st: &ExplorerState, v: ViewMode) -> Option<Grid> {
+    let mut g = grid_for(v)?;
+    if let (Some((w, h)), ViewMode::LargeIcons) = (st.qa_cell, v) {
+        g.cell = vec2(w, h);
+        g.icon = (w - 14.0).clamp(40.0, 96.0);
+    }
+    Some(g)
+}
+
 fn details_width(st: &ExplorerState) -> f32 {
     st.columns
         .iter()
@@ -470,7 +480,7 @@ fn build_layout<'a>(st: &ExplorerState, set: &'a GroupSet, avail: Vec2) -> Layou
             geo = Geo::List { col_w, per_col };
         }
         v => {
-            let g = grid_for(v).expect("grid view");
+            let g = grid_of(st, v).expect("grid view");
             let cols = (((avail.x - 8.0) / g.cell.x).floor() as usize).max(1);
             for (gi, grp) in set.groups.iter().enumerate() {
                 let (hdr_y, y0, collapsed) = open(gi, &mut y);
@@ -534,10 +544,10 @@ pub fn show(ui: &mut Ui, state: &mut ExplorerState) {
     ghost(ui);
 }
 
-/// Quick access: visited folders on top as large icons, opened files below in the view the
-/// user picked (Details by default). Each pane lists only its own kind of item.
+/// Quick access: the 16 most recent folders as large icons in two rows of eight (the cell
+/// width scales with the window, so it is always two rows), and the 30 most recent files
+/// right below them in the view the user picked (Details by default).
 fn show_history(ui: &mut Ui, state: &mut ExplorerState) {
-    const CELL: Vec2 = vec2(116.0, 142.0); // the LargeIcons cell
     let files_view = state.view;
     let avail = ui.available_size();
 
@@ -545,12 +555,27 @@ fn show_history(ui: &mut Ui, state: &mut ExplorerState) {
     state.view = ViewMode::LargeIcons;
     let folders = state.visible_count();
     if folders > 0 {
-        let cols = (((avail.x - 12.0 - 8.0) / CELL.x).floor() as usize).max(1);
-        let wanted = folders.div_ceil(cols) as f32 * CELL.y + 12.0;
-        // At most half the pane, so the files always stay reachable.
-        let height = wanted.min(avail.y * 0.5).max(CELL.y.min(avail.y * 0.5));
+        // The grid lays out in `avail.x - 12` (scrollbar) minus 8 (margin).
+        let cell_w = ((avail.x - 20.0) / QA_FOLDER_COLS as f32)
+            .floor()
+            .clamp(60.0, 150.0);
+        let icon = (cell_w - 14.0).clamp(40.0, 96.0);
+        let cell = vec2(cell_w, icon + 46.0);
+        state.qa_cell = Some((cell.x, cell.y));
+        let cols = (((avail.x - 20.0) / cell.x).floor() as usize).max(1);
+        let rows = folders.div_ceil(cols).max(1);
+        // Exactly the rows needed (4 top pad + 8 bottom pad), so the files start right after.
+        let wanted = rows as f32 * cell.y + 12.0;
+        let height = wanted.min((avail.y - 120.0).max(cell.y + 12.0));
         ui.allocate_ui(vec2(avail.x, height), |ui| show_pane(ui, state));
-        ui.separator();
+        state.qa_cell = None;
+        // Hairline divider without the extra spacing a separator adds.
+        let (line, _) = ui.allocate_exact_size(vec2(avail.x, 1.0), egui::Sense::hover());
+        ui.painter().hline(
+            line.x_range(),
+            line.center().y,
+            ui.visuals().widgets.noninteractive.bg_stroke,
+        );
     }
 
     state.view = files_view;
@@ -633,7 +658,7 @@ fn render(
                 });
         }
         v => {
-            let grid = grid_for(v);
+            let grid = grid_of(st, v);
             ScrollArea::vertical()
                 .id_salt((salt, "v"))
                 .wheel_scroll_multiplier(egui::vec2(SCROLL_SPEED, SCROLL_SPEED))

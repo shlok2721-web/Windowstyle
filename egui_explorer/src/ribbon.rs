@@ -515,11 +515,7 @@ impl Ribbon {
                 },
                 Group {
                     title: "",
-                    items: vec![Item::Large(Button::dropdown(
-                        "Options",
-                        I::Options,
-                        vec![M::item("Change folder and search options", C::Options)],
-                    ))],
+                    items: vec![Item::Large(Button::new("Options", I::Options, C::Options))],
                 },
             ],
         };
