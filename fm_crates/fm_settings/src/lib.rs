@@ -304,6 +304,10 @@ pub struct Settings {
     /// Include application-data folders (`.var`, browser profiles, ...) in file search.
     #[serde(default, rename = "search-app-data")]
     pub search_app_data: bool,
+    /// When replacing a file or folder of the same name (copy/move → "Replace"), delete the
+    /// original permanently instead of sending it to the Trash. Off by default.
+    #[serde(default, rename = "permanent-delete-on-replace")]
+    pub permanent_delete_on_replace: bool,
     /// Maximum thumbnail edge in pixels. Invalid values are clamped by the consumer.
     #[serde(default = "default_thumbnail_edge")]
     pub thumbnail_edge: u32,
@@ -339,6 +343,7 @@ impl Default for Settings {
             thumbnails: true,
             dark_mode: false,
             search_app_data: false,
+            permanent_delete_on_replace: false,
             thumbnail_edge: 256,
             navigation_icon_size: default_navigation_icon_size(),
             email_command: default_email_command(),

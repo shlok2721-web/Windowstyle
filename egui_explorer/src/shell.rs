@@ -1509,6 +1509,8 @@ fn history_popup(resp: &Response, state: &mut ExplorerState) {
 fn seg_label(p: &Path) -> String {
     if p == Path::new(THIS_PC_LOCATION) {
         "This PC".into()
+    } else if p == Path::new(QUICK_ACCESS_LOCATION) {
+        "Quick access".into()
     } else {
         p.file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -1584,6 +1586,8 @@ fn address_bar(ui: &mut Ui, state: &mut ExplorerState, rect: Rect) {
         Rect::from_center_size(pos2(rect.left() + 14.0, rect.center().y), vec2(16.0, 16.0));
     let location_icon = if state.location == Path::new(THIS_PC_LOCATION) {
         Icon::ThisPc
+    } else if state.location == Path::new(QUICK_ACCESS_LOCATION) {
+        Icon::QuickAccess
     } else if state.location == Path::new("/") {
         Icon::Drive
     } else {
@@ -1655,6 +1659,8 @@ fn address_bar(ui: &mut Ui, state: &mut ExplorerState, rect: Rect) {
     // ---- breadcrumbs ---------------------------------------------------------------------
     let mut segs: Vec<(String, PathBuf)> = if state.location == Path::new(THIS_PC_LOCATION) {
         vec![("This PC".to_owned(), state.location.clone())]
+    } else if state.location == Path::new(QUICK_ACCESS_LOCATION) {
+        vec![("Quick access".to_owned(), state.location.clone())]
     } else {
         state
             .location
@@ -1958,7 +1964,8 @@ fn nav_node(
     let mut drop_hover = false;
     // This PC is a virtual overview, not a real destination directory.
     // Keep it navigable/expandable but never expose it as a drop target.
-    let accepts_drop = n.path != Path::new(THIS_PC_LOCATION);
+    let accepts_drop = n.path != Path::new(THIS_PC_LOCATION)
+        && n.path != Path::new(QUICK_ACCESS_LOCATION);
     if accepts_drop {
         if let Some(pl) = resp.dnd_hover_payload::<Vec<PathBuf>>() {
             drop_hover = !pl.contains(&n.path);

@@ -15,6 +15,10 @@ use crate::ribbon::ContextKind;
 /// Virtual location used by hosts for the drive overview. It is not a real filesystem path.
 pub const THIS_PC_LOCATION: &str = "this-pc://";
 
+/// Virtual location used by hosts for the Quick access history view (visited folders on top,
+/// opened files below). Like [`THIS_PC_LOCATION`] it is not a real filesystem path.
+pub const QUICK_ACCESS_LOCATION: &str = "quick-access://";
+
 /// A regular file with an execute bit (binary, AppImage, script with a shebang).
 pub fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -56,6 +60,12 @@ pub struct Entry {
     /// entries. An unmounted drive has no usable `path` to browse into; mounting it is
     /// what makes one available.
     pub mounted: bool,
+    /// For drives: whether the host can mount the device (it carries a recognised
+    /// filesystem). Always `true` for non-drive entries and for already mounted drives.
+    pub mountable: bool,
+    /// When the item was last opened / visited. Only filled by hosts for history views
+    /// (Quick access); `None` elsewhere.
+    pub accessed: Option<SystemTime>,
     /// Optional thumbnail texture shown in the icon views instead of the vector icon.
     pub thumbnail: Option<egui::TextureId>,
     /// Pixel size (width, height) of `thumbnail`, so it can be drawn at its original aspect ratio.
@@ -92,6 +102,8 @@ impl Entry {
             space: None,
             device: None,
             mounted: true,
+            mountable: true,
+            accessed: None,
             thumbnail: None,
             thumb_size: None,
         }
@@ -228,6 +240,8 @@ pub enum SortKey {
     DateModified,
     Type,
     Size,
+    /// Only offered as a column in the Quick access history view.
+    LastAccessed,
 }
 
 impl SortKey {
@@ -243,6 +257,7 @@ impl SortKey {
             SortKey::DateModified => "Date modified",
             SortKey::Type => "Type",
             SortKey::Size => "Size",
+            SortKey::LastAccessed => "Last accessed",
         }
     }
 }
@@ -651,6 +666,26 @@ pub struct Column {
     pub visible: bool,
 }
 
+/// Which entries the item pane lists. Only the Quick access history view narrows it: it
+/// draws its folders and its files as two panes, each with a different view mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ListScope {
+    #[default]
+    All,
+    FoldersOnly,
+    FilesOnly,
+}
+
+/// The view parameters that the Quick access history view temporarily replaces.
+struct ViewStash {
+    view: ViewMode,
+    sort_key: SortKey,
+    sort_order: SortOrder,
+    group: GroupKey,
+    folders_first: bool,
+    columns: Vec<Column>,
+}
+
 pub struct RenameState {
     pub path: PathBuf,
     pub text: String,
@@ -676,6 +711,10 @@ pub struct ExplorerState {
     pub group: GroupKey,
     pub columns: Vec<Column>,
     pub folders_first: bool,
+    /// View settings parked while the Quick access history view is on screen.
+    history_stash: Option<Box<ViewStash>>,
+    /// Narrows the listing to folders or files (set only while the history panes are drawn).
+    pub scope: ListScope,
     // --- selection ---
     pub selection: HashSet<PathBuf>,
     pub focus: Option<PathBuf>,
@@ -785,6 +824,8 @@ impl Default for ExplorerState {
                 },
             ],
             folders_first: true,
+            history_stash: None,
+            scope: ListScope::All,
             selection: HashSet::new(),
             focus: None,
             anchor: None,
@@ -846,6 +887,64 @@ impl ExplorerState {
 
     // ---- host API ------------------------------------------------------
 
+    /// Entering the Quick access history switches to a Details view sorted by last access
+    /// (newest first) with a "Last accessed" column; leaving it brings the previous view,
+    /// sort and columns back, so browsing history never disturbs a folder's own view.
+    fn switch_history_view(&mut self, next: &Path) {
+        let entering = next == Path::new(QUICK_ACCESS_LOCATION) && !self.in_quick_access();
+        let leaving = self.in_quick_access() && next != Path::new(QUICK_ACCESS_LOCATION);
+        if entering {
+            let columns = vec![
+                Column {
+                    key: SortKey::Name,
+                    width: 300.0,
+                    visible: true,
+                },
+                Column {
+                    key: SortKey::LastAccessed,
+                    width: 150.0,
+                    visible: true,
+                },
+                Column {
+                    key: SortKey::DateModified,
+                    width: 140.0,
+                    visible: true,
+                },
+                Column {
+                    key: SortKey::Type,
+                    width: 120.0,
+                    visible: true,
+                },
+                Column {
+                    key: SortKey::Size,
+                    width: 80.0,
+                    visible: true,
+                },
+            ];
+            self.history_stash = Some(Box::new(ViewStash {
+                view: self.view,
+                sort_key: self.sort_key,
+                sort_order: self.sort_order,
+                group: self.group,
+                folders_first: self.folders_first,
+                columns: std::mem::replace(&mut self.columns, columns),
+            }));
+            self.view = ViewMode::Details;
+            self.sort_key = SortKey::LastAccessed;
+            self.sort_order = SortOrder::Descending;
+            self.group = GroupKey::None;
+            // Visited folders on top, opened files below.
+            self.folders_first = true;
+        } else if leaving && let Some(stash) = self.history_stash.take() {
+            self.view = stash.view;
+            self.sort_key = stash.sort_key;
+            self.sort_order = stash.sort_order;
+            self.group = stash.group;
+            self.folders_first = stash.folders_first;
+            self.columns = stash.columns;
+        }
+    }
+
     /// Tell the UI which folder is now displayed and what it contains.
     /// Maintains the Back/Forward history automatically.
     pub fn set_location(&mut self, path: impl Into<PathBuf>, entries: Vec<Entry>) {
@@ -855,8 +954,11 @@ impl ExplorerState {
             self.history.push(path.clone());
             self.history_cursor = self.history.len() - 1;
         }
+        self.switch_history_view(&path);
         self.title = if path == Path::new(THIS_PC_LOCATION) {
             "This PC".to_owned()
+        } else if path == Path::new(QUICK_ACCESS_LOCATION) {
+            "Quick access".to_owned()
         } else {
             path.file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -923,6 +1025,18 @@ impl ExplorerState {
 
     // ---- history ---------------------------------------------------------
 
+    /// Whether the folder on screen is a virtual overview (This PC, Quick access) rather than
+    /// a real directory: it has no parent and nothing can be created in it.
+    pub fn in_virtual_location(&self) -> bool {
+        self.location == Path::new(THIS_PC_LOCATION)
+            || self.location == Path::new(QUICK_ACCESS_LOCATION)
+    }
+
+    /// Whether the Quick access history view is on screen.
+    pub fn in_quick_access(&self) -> bool {
+        self.location == Path::new(QUICK_ACCESS_LOCATION)
+    }
+
     pub fn can_go_back(&self) -> bool {
         self.history_cursor > 0
     }
@@ -930,7 +1044,7 @@ impl ExplorerState {
         self.history_cursor + 1 < self.history.len()
     }
     pub fn can_go_up(&self) -> bool {
-        self.location != Path::new(THIS_PC_LOCATION) && self.location.parent().is_some()
+        !self.in_virtual_location() && self.location.parent().is_some()
     }
     pub fn go_back(&mut self) {
         if self.can_go_back() {
@@ -947,7 +1061,7 @@ impl ExplorerState {
         }
     }
     pub fn go_up(&mut self) {
-        if self.location == Path::new(THIS_PC_LOCATION) {
+        if self.in_virtual_location() {
             return;
         }
         if let Some(p) = self.location.parent() {
@@ -1012,6 +1126,7 @@ impl ExplorerState {
                 && s.sort_key == self.sort_key
                 && s.desc == desc
                 && s.folders_first == self.folders_first
+                && s.scope == self.scope
                 && s.search == self.search_text
         });
         if fresh {
@@ -1028,6 +1143,7 @@ impl ExplorerState {
                 s.sort_key = self.sort_key;
                 s.desc = desc;
                 s.folders_first = self.folders_first;
+                s.scope = self.scope;
                 s.search.clear();
                 s.search.push_str(&self.search_text);
             }
@@ -1040,6 +1156,7 @@ impl ExplorerState {
                     sort_key: self.sort_key,
                     desc,
                     folders_first: self.folders_first,
+                    scope: self.scope,
                     search: self.search_text.clone(),
                 });
             }
@@ -1054,6 +1171,11 @@ impl ExplorerState {
             .iter()
             .enumerate()
             .filter(|(_, e)| self.show_hidden || !e.hidden)
+            .filter(|(_, e)| match self.scope {
+                ListScope::All => true,
+                ListScope::FoldersOnly => e.is_dir(),
+                ListScope::FilesOnly => !e.is_dir(),
+            })
             .filter(|(_, e)| needle.is_empty() || e.name_lc.contains(&needle))
             .map(|(i, _)| i)
             .collect();
@@ -1107,6 +1229,10 @@ impl ExplorerState {
                 SortKey::Size => a
                     .size
                     .cmp(&b.size)
+                    .then_with(|| natural_cmp(&a.name, &b.name)),
+                SortKey::LastAccessed => a
+                    .accessed
+                    .cmp(&b.accessed)
                     .then_with(|| natural_cmp(&a.name, &b.name)),
                 // The Type branch returns above.
                 SortKey::Type => a.type_name.cmp(&b.type_name),
@@ -1354,6 +1480,11 @@ impl ExplorerState {
         } else {
             None
         };
+        sum.single_drive_mountable = if sum.count == 1 && first_is_drive {
+            sum.first.is_some_and(|i| self.entries[i].mountable)
+        } else {
+            false
+        };
         sum.context = if sum.count == 1 && first_is_drive {
             Some(ContextKind::Drive)
         } else if let CtxAcc::Kind(k) = ctx {
@@ -1438,7 +1569,9 @@ impl ExplorerState {
     /// Whether a command can currently run (used to grey out buttons).
     pub fn is_enabled(&self, cmd: Command) -> bool {
         let n = self.selection.len();
-        let in_this_pc = self.location == Path::new(THIS_PC_LOCATION);
+        // Neither virtual overview is a real folder: nothing can be created or pasted there.
+        let in_this_pc = self.location == Path::new(THIS_PC_LOCATION)
+            || self.location == Path::new(QUICK_ACCESS_LOCATION);
         // A drive entry denotes an entire mounted volume. Never offer operations
         // that would recursively copy, move, rename, hide, compress, or delete it.
         if n > 0
@@ -1524,7 +1657,10 @@ impl ExplorerState {
             Command::Redo => self.can_redo,
             Command::Extract | Command::ExtractHere => self.selection_has_archive(),
             Command::Eject => self.selection_summary().single_drive_mounted == Some(true),
-            Command::MountDrive => self.selection_summary().single_drive_mounted == Some(false),
+            Command::MountDrive => {
+                let sum = self.selection_summary();
+                sum.single_drive_mounted == Some(false) && sum.single_drive_mountable
+            }
             _ => true,
         }
     }
@@ -1566,6 +1702,7 @@ impl ExplorerState {
                         SortKey::DateModified => 140.0,
                         SortKey::Type => 110.0,
                         SortKey::Size => 80.0,
+                        SortKey::LastAccessed => 150.0,
                     };
                 }
             }
@@ -1709,6 +1846,7 @@ pub(crate) struct OrderSig {
     sort_key: SortKey,
     desc: bool,
     folders_first: bool,
+    scope: ListScope,
     search: String,
 }
 
@@ -1787,6 +1925,8 @@ pub(crate) struct SelSummary {
     /// `Some(mounted)` when exactly one drive is selected; `None` otherwise (nothing
     /// selected, more than one item, or the single selection is not a drive).
     pub single_drive_mounted: Option<bool>,
+    /// For a single selected drive: whether the host can mount it (see [`Entry::mountable`]).
+    pub single_drive_mountable: bool,
 }
 
 impl SelSummary {
@@ -2081,6 +2221,45 @@ mod cache_tests {
     fn assert_fresh(st: &ExplorerState, why: &str) {
         assert_eq!(st.visible_order(), st.compute_order(), "{why}");
         assert_eq!(st.visible_count(), st.compute_order().len(), "{why}");
+    }
+
+    #[test]
+    fn quick_access_switches_the_view_and_restores_it_on_leaving() {
+        let mut st = ExplorerState::new();
+        st.set_location("/home/user", vec![]);
+        st.view = ViewMode::LargeIcons;
+        st.sort_key = SortKey::Size;
+        let columns_before = st.columns.len();
+
+        st.set_location(QUICK_ACCESS_LOCATION, vec![]);
+        assert_eq!(st.title, "Quick access");
+        assert!(st.in_quick_access() && !st.can_go_up());
+        assert_eq!(st.view, ViewMode::Details);
+        assert_eq!(st.sort_key, SortKey::LastAccessed);
+        assert_eq!(st.sort_order, SortOrder::Descending);
+        assert!(st.columns.iter().any(|c| c.key == SortKey::LastAccessed));
+
+        st.set_location("/home/user", vec![]);
+        assert_eq!(st.view, ViewMode::LargeIcons);
+        assert_eq!(st.sort_key, SortKey::Size);
+        assert_eq!(st.columns.len(), columns_before);
+        assert!(!st.columns.iter().any(|c| c.key == SortKey::LastAccessed));
+    }
+
+    #[test]
+    fn unmountable_unmounted_drive_cannot_be_mounted() {
+        let mut st = ExplorerState::new();
+        let mut drive = Entry::new("device:///dev/sdb2", EntryKind::Drive);
+        drive.mounted = false;
+        drive.mountable = false;
+        st.set_location(THIS_PC_LOCATION, vec![drive.clone()]);
+        st.select_only(&drive.path);
+        assert!(!st.is_enabled(Command::MountDrive));
+        let mut mountable = drive.clone();
+        mountable.mountable = true;
+        st.set_location(THIS_PC_LOCATION, vec![mountable.clone()]);
+        st.select_only(&mountable.path);
+        assert!(st.is_enabled(Command::MountDrive));
     }
 
     #[test]
