@@ -437,6 +437,21 @@ impl Behavior {
         rows
     }
 
+    /// The `limit` most recently accessed paths (folders entered and files opened), newest
+    /// first, each with the unix time of its last access. Reflects folded events only, so
+    /// call [`fold`](Self::fold) first to include the latest activity. Entries age out
+    /// through the same pruning as frecency, so this is a bounded recent-history list.
+    pub fn recent(&self, limit: usize) -> Vec<(PathBuf, u64)> {
+        let mut rows: Vec<(PathBuf, u64)> = self
+            .frecency
+            .iter()
+            .map(|(p, f)| (p.clone(), f.at))
+            .collect();
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        rows.truncate(limit);
+        rows
+    }
+
     /// The most likely next directories after `dir`, best first (at most `limit`).
     pub fn predict_next(&self, dir: &Path, limit: usize) -> Vec<PathBuf> {
         self.next
@@ -695,6 +710,21 @@ mod tests {
 
     fn p(s: &str) -> PathBuf {
         PathBuf::from(s)
+    }
+
+    #[test]
+    fn recent_lists_newest_access_first_with_its_time() {
+        let mut b = Behavior::new();
+        b.open_dir(&p("/a"), 100);
+        b.open_file(&p("/a/f.txt"), 300);
+        b.open_dir(&p("/b"), 200);
+        b.fold(300);
+        let recent = b.recent(10);
+        // Opening a file also touches its folder, so /a was last accessed at 300 too.
+        assert_eq!(recent[0].1, 300);
+        assert_eq!(recent.last().map(|r| r.0.clone()), Some(p("/b")));
+        assert!(recent.iter().any(|(path, at)| path == &p("/b") && *at == 200));
+        assert_eq!(b.recent(1).len(), 1);
     }
 
     #[test]

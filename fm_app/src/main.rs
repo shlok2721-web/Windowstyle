@@ -19,7 +19,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use egui::{ColorImage, TextureHandle, TextureOptions};
 use egui_explorer::{
     Command, CompressFormat, Entry, EntryKind, Event, Explorer, ExplorerState, Icon, NavNode,
-    PermMode, RibbonMode, THIS_PC_LOCATION, dialogs,
+    PermMode, QUICK_ACCESS_LOCATION, RibbonMode, THIS_PC_LOCATION, dialogs,
 };
 use fm_behav::Behavior;
 use fm_persist::{AtomicFile, FlushPolicy, Flusher, Outcome, WriteCounter};
@@ -36,6 +36,8 @@ const WORKER_MESSAGES_PER_FRAME: usize = 16;
 /// Bound filesystem-event batches applied while holding the hot-tier lock per UI frame.
 const TIER_EVENT_BATCHES_PER_FRAME: usize = 16;
 const SEARCH_LIMIT: usize = 500;
+/// Most folders and files listed in the Quick access history view.
+const HISTORY_LIMIT: usize = 300;
 /// Paths gathered before ranking and cutting to `SEARCH_LIMIT`.
 const RAW_SEARCH_LIMIT: usize = 5000;
 /// Folder names whose contents are never searched (caches and clutter with random names).
@@ -87,7 +89,7 @@ const UPDATEDB_SCRIPT: &str = "sudo updatedb; echo; echo Press Enter to close; r
 const FOLD_INTERVAL: Duration = Duration::from_secs(5);
 /// The idle app wakes this often so the periodic flush check can run.
 const IDLE_WAKE: Duration = Duration::from_secs(30 * 60);
-const QUICK_ACCESS_ID: &str = "quick-access://";
+const QUICK_ACCESS_ID: &str = QUICK_ACCESS_LOCATION;
 /// Extra windows (besides the first) one process will open.
 const MAX_CHILD_WINDOWS: usize = 12;
 /// Status-bar messages disappear after this long.
@@ -307,6 +309,17 @@ struct JobOutcome {
     search: Option<(PathBuf, Vec<Entry>, String)>,
     /// Search generation this job belongs to (0 = not a search).
     search_generation: u64,
+    /// The window that started the job (`0` is the first window, child windows use their
+    /// serial). A search result is applied to that window, not to whichever one polls it.
+    window: u32,
+}
+
+/// A finished folder search, waiting for its window to apply it.
+struct SearchResult {
+    root: PathBuf,
+    entries: Vec<Entry>,
+    message: String,
+    generation: u64,
 }
 
 /// Drive-scan interval: 0 means never (no polling); anything else is clamped to 5..=20 s.
@@ -399,6 +412,10 @@ struct ChildWindow {
     pending_transfer: Option<PendingTransfer>,
     pending_delete: Option<Vec<PathBuf>>,
     pending_extract: Option<PendingExtract>,
+    /// Per-window search state (see the same fields on `App`).
+    search_generation: u64,
+    current_window: u32,
+    search_results: Vec<SearchResult>,
     status: String,
     status_seen: String,
     status_seen_at: Instant,
@@ -548,7 +565,13 @@ struct AppCore {
     /// File operations currently running on job threads.
     jobs_running: usize,
     /// Bumped by every new folder search; a finished search for an older number is dropped.
+    /// Per window: swapped together with the rest of the window state.
     search_generation: u64,
+    /// Which window is currently swapped into the app: `0` for the first window, else the
+    /// serial of the child window being drawn.
+    current_window: u32,
+    /// Finished searches of this window that have not been applied yet.
+    search_results: Vec<SearchResult>,
     thumbnails_pending: HashSet<PathBuf>,
     thumbnails_failed: HashSet<PathBuf>,
     textures: HashMap<PathBuf, CachedTexture>,
@@ -573,6 +596,8 @@ struct AppCore {
     /// Entry path (mountpoint, or `device://<node>` while unmounted) -> backing block
     /// device, refreshed every `tick_drive_poll`. Used to resolve Mount/Unmount targets.
     drive_devices: std::collections::HashMap<PathBuf, String>,
+    /// Placeholder paths of partitions that are listed but cannot be mounted (no filesystem).
+    drive_unmountable: HashSet<PathBuf>,
     /// The folder shown before the current one, used to tell "back" from "open".
     prev_location: Option<PathBuf>,
     watcher: Option<fm_notify::DirWatcher>,
@@ -874,6 +899,8 @@ impl AppCore {
             egui_ctx: ctx.clone(),
             jobs_running: 0,
             search_generation: 0,
+            current_window: 0,
+            search_results: Vec::new(),
             thumbnails_pending: HashSet::new(),
             thumbnails_failed: HashSet::new(),
             textures: HashMap::new(),
@@ -896,6 +923,7 @@ impl AppCore {
             // (drive_poll_secs is clamped to at most 20s, so 60s back is always enough).
             last_drive_poll: Instant::now() - Duration::from_secs(60),
             drive_scan_busy: Arc::new(AtomicBool::new(false)),
+            drive_unmountable: HashSet::new(),
             drive_devices: std::collections::HashMap::new(),
             prev_location: None,
             watcher,
@@ -1031,17 +1059,32 @@ impl AppCore {
     }
 
     fn navigate(&mut self, path: PathBuf) {
-        // Synthetic nav-tree anchors are not real folders; redirect them.
-        let path = match path.to_str() {
-            Some(QUICK_ACCESS_ID) => dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")),
-            _ => path,
-        };
         self.status.clear();
         if path
             .to_str()
             .is_some_and(|s| s.starts_with(UNMOUNTED_DRIVE_PREFIX))
         {
-            self.status = "This drive isn't mounted yet. Right-click it and choose Mount.".into();
+            self.status = if self.drive_unmountable.contains(&path) {
+                "This partition has no filesystem Windowstyle can mount.".into()
+            } else {
+                "This drive isn't mounted yet. Right-click it and choose Mount.".into()
+            };
+            return;
+        }
+        if path == Path::new(QUICK_ACCESS_ID) {
+            // Virtual history view: visited folders, then opened files. It is built from the
+            // behaviour log, so it is never answered from a directory listing.
+            let refresh = path == self.state.location;
+            if !refresh {
+                self.prev_location = Some(self.state.location.clone());
+            }
+            let entries = self.history_entries();
+            self.state.set_location(path.clone(), entries);
+            self.thumbnails_failed.clear();
+            if let Some(watcher) = self.watcher.as_mut() {
+                let _ = watcher.set_dir(None);
+            }
+            self.folder_view_active = None;
             return;
         }
         if path == Path::new(THIS_PC_LOCATION) {
@@ -1222,7 +1265,7 @@ impl AppCore {
         let spawned = thread::Builder::new()
             .name("file-manager-drive-scan".into())
             .spawn(move || {
-                let list = drives();
+                let list = drives_with(true);
                 let entries = this_pc_entries_from(list.clone());
                 if tx.send(WorkerMessage::Drives { list, entries }).is_err() {
                     busy.store(false, Ordering::Release);
@@ -1238,6 +1281,11 @@ impl AppCore {
     fn apply_drives(&mut self, list: Vec<Drive>, entries: Vec<Entry>) {
         self.drive_scan_busy.store(false, Ordering::Release);
         self.drive_devices.clear();
+        self.drive_unmountable = list
+            .iter()
+            .filter(|d| !d.mounted && !d.mountable)
+            .map(|d| d.path.clone())
+            .collect();
         for d in &list {
             if let Some(dev) = &d.device {
                 self.drive_devices.insert(d.path.clone(), dev.clone());
@@ -1251,6 +1299,7 @@ impl AppCore {
         {
             node.children = Some(
                 list.iter()
+                    .filter(|d| d.mounted || d.mountable)
                     .map(|d| {
                         let icon = if d.path == Path::new("/") {
                             Icon::Drive
@@ -1950,7 +1999,8 @@ impl AppCore {
             self.state.cut.clear();
             self.state.clipboard_has_items = self.clipboard.is_some();
         }
-        self.spawn_job(move || transfer_job(origin, paths, dest, cut, choice));
+        let permanent_replace = self.settings.permanent_delete_on_replace;
+        self.spawn_job(move || transfer_job(origin, paths, dest, cut, choice, permanent_replace));
     }
 
     /// Offer the copied files to other applications as a standard file list
@@ -2220,11 +2270,48 @@ impl AppCore {
         });
     }
 
+    /// Entries of the Quick access history view: every recently visited folder and opened
+    /// file with the time it was last accessed (newest first once sorted). Items that no
+    /// longer exist are left out.
+    fn history_entries(&mut self) -> Vec<Entry> {
+        // Bring the latest navigation and opens into the aggregates the query reads.
+        self.behavior.fold(unix_now());
+        self.flusher.mark_dirty(self.behavior.take_dirty());
+        let mut entries = Vec::new();
+        for (path, at) in self.behavior.recent(HISTORY_LIMIT) {
+            let Ok(meta) = fs::metadata(&path) else {
+                continue;
+            };
+            let is_dir = meta.is_dir();
+            let mut e = Entry::new(
+                &path,
+                if is_dir {
+                    EntryKind::Folder
+                } else {
+                    EntryKind::File
+                },
+            );
+            e.accessed = Some(UNIX_EPOCH + Duration::from_secs(at));
+            e.modified = meta.modified().ok();
+            if !is_dir {
+                e.size = meta.len();
+                e.type_name = fm_mime::guess(&path).type_name;
+            }
+            entries.push(e);
+        }
+        entries
+    }
+
     fn reload(&mut self) {
         // An explicit reload (user refresh, own file operation, change event) must never be
         // answered from RAM.
         if self.state.location == Path::new(THIS_PC_LOCATION) {
             self.state.set_entries(this_pc_entries());
+            return;
+        }
+        if self.state.location == Path::new(QUICK_ACCESS_ID) {
+            let entries = self.history_entries();
+            self.state.set_entries(entries);
             return;
         }
         tiers().invalidate(&self.state.location);
@@ -2291,19 +2378,24 @@ impl AppCore {
     fn finish_job(&mut self, outcome: JobOutcome) {
         self.jobs_running = self.jobs_running.saturating_sub(1);
         if let Some((root, entries, message)) = outcome.search {
-            // Only the newest search may replace the listing, and only if the user is
-            // still looking at the folder it searched.
-            if outcome.search_generation == self.search_generation
-                && self.state.location == root
-                && !self.state.search_text.trim().is_empty()
+            // Results are polled by the first window, but belong to the window whose search
+            // box started them. Hand a child window its result instead of judging it
+            // against the first window's folder (which silently dropped it).
+            let result = SearchResult {
+                root,
+                entries,
+                message,
+                generation: outcome.search_generation,
+            };
+            if outcome.window == self.current_window {
+                self.apply_search_result(result);
+            } else if let Some(child) = self
+                .children
+                .iter_mut()
+                .find(|child| child.current_window == outcome.window)
             {
-                // Keep the typed text and the history; the listing becomes the ranked results.
-                self.state.set_entries(entries);
-                self.state.search_active = true;
-                self.attach_current_thumbnails();
-                self.status = message;
-            } else if self.jobs_running == 0 && self.status.ends_with('…') {
-                self.status.clear();
+                child.search_results.push(result);
+                self.egui_ctx.request_repaint_of(child.id);
             }
             return;
         }
@@ -2321,6 +2413,24 @@ impl AppCore {
         tiers().invalidate(&outcome.origin);
         if outcome.origin == self.state.location {
             self.reload();
+        }
+    }
+
+    /// Show a finished search in the window that is currently swapped in. Only the newest
+    /// search of that window may replace the listing, and only while the window is still on
+    /// the folder that was searched.
+    fn apply_search_result(&mut self, result: SearchResult) {
+        if result.generation == self.search_generation
+            && self.state.location == result.root
+            && !self.state.search_text.trim().is_empty()
+        {
+            // Keep the typed text and the history; the listing becomes the ranked results.
+            self.state.set_entries(result.entries);
+            self.state.search_active = true;
+            self.attach_current_thumbnails();
+            self.status = result.message;
+        } else if self.jobs_running == 0 && self.status.ends_with('…') {
+            self.status.clear();
         }
     }
 
@@ -2580,6 +2690,10 @@ impl AppCore {
                     self.navigate(path);
                 } else {
                     self.behavior.open_file(&path, unix_now());
+                    if self.state.in_quick_access() {
+                        // The file just opened moves to the top of the history list.
+                        self.reload();
+                    }
                     // A choice made with "Remember my choice" wins over the system default.
                     let remembered = open_with::remembered_id(&path)
                         .and_then(|id| open_with::resolve_choice(&id));
@@ -2672,6 +2786,7 @@ impl AppCore {
         let root = self.state.location.clone();
         self.search_generation = self.search_generation.wrapping_add(1);
         let generation = self.search_generation;
+        let window = self.current_window;
         self.status = format!("Searching for '{shown}'…");
         let filter = SearchFilter::new(self.settings.search_app_data);
         self.spawn_job(move || {
@@ -2682,6 +2797,7 @@ impl AppCore {
                 origin: root.clone(),
                 search: Some((root, found, message)),
                 search_generation: generation,
+                window,
                 ..JobOutcome::default()
             }
         });
@@ -2692,6 +2808,10 @@ impl AppCore {
     fn search(&mut self, query: String) {
         if query.trim().is_empty() {
             self.status = "Enter a search term.".into();
+            return;
+        }
+        if self.state.in_virtual_location() {
+            self.status = "Open a folder to search in it.".into();
             return;
         }
         if is_ram_filesystem(&self.state.location) {
@@ -2714,6 +2834,7 @@ impl AppCore {
         let root = self.state.location.clone();
         self.search_generation = self.search_generation.wrapping_add(1);
         let generation = self.search_generation;
+        let window = self.current_window;
         self.status = format!("Searching for '{shown}'…");
         let filter = SearchFilter::new(self.settings.search_app_data);
         self.spawn_job(move || {
@@ -2754,6 +2875,7 @@ impl AppCore {
                 origin: root.clone(),
                 search: Some((root, found, message)),
                 search_generation: generation,
+                window,
                 ..JobOutcome::default()
             }
         });
@@ -3312,6 +3434,10 @@ impl AppCore {
     }
 
     fn window_frame(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // Searches this window started finish on a worker and are handed over here.
+        for result in std::mem::take(&mut self.search_results) {
+            self.apply_search_result(result);
+        }
         // Settings are the single source of truth for the theme, so all windows agree.
         self.state.dark_mode = self.settings.dark_mode;
         self.state.nav_icon_size = self.settings.navigation_icon_size.clamp(12, 48) as f32;
@@ -3375,6 +3501,9 @@ impl AppCore {
         std::mem::swap(&mut self.pending_transfer, &mut w.pending_transfer);
         std::mem::swap(&mut self.pending_delete, &mut w.pending_delete);
         std::mem::swap(&mut self.pending_extract, &mut w.pending_extract);
+        std::mem::swap(&mut self.search_generation, &mut w.search_generation);
+        std::mem::swap(&mut self.current_window, &mut w.current_window);
+        std::mem::swap(&mut self.search_results, &mut w.search_results);
         std::mem::swap(&mut self.status, &mut w.status);
         std::mem::swap(&mut self.status_seen, &mut w.status_seen);
         std::mem::swap(&mut self.status_seen_at, &mut w.status_seen_at);
@@ -3462,6 +3591,9 @@ impl AppCore {
             pending_transfer: None,
             pending_delete: None,
             pending_extract: None,
+            search_generation: 0,
+            current_window: serial,
+            search_results: Vec::new(),
             status: "Loading folder…".into(),
             status_seen: String::new(),
             status_seen_at: Instant::now(),
@@ -3816,10 +3948,16 @@ fn paths_from_clipboard_text(text: &str) -> Vec<PathBuf> {
 
 /// "<folder> - File Manager", as shown in an extra window's title bar.
 fn window_title(location: &Path) -> String {
-    let name = location
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| location.display().to_string());
+    let name = if location == Path::new(THIS_PC_LOCATION) {
+        "This PC".to_owned()
+    } else if location == Path::new(QUICK_ACCESS_ID) {
+        "Quick access".to_owned()
+    } else {
+        location
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| location.display().to_string())
+    };
     format!("{name} - File Manager")
 }
 
@@ -3944,6 +4082,8 @@ fn folder_view_from_state(state: &ExplorerState) -> FolderView {
             egui_explorer::SortKey::DateModified => SavedSortKey::DateModified,
             egui_explorer::SortKey::Type => SavedSortKey::Type,
             egui_explorer::SortKey::Size => SavedSortKey::Size,
+            // Only used by the Quick access history view, which is never remembered.
+            egui_explorer::SortKey::LastAccessed => SavedSortKey::DateModified,
         },
         sort_order: match state.sort_order {
             egui_explorer::SortOrder::Ascending => SavedSortOrder::Ascending,
@@ -4217,15 +4357,99 @@ fn quick_access_nodes(user_pins: &[PathBuf]) -> Vec<NavNode> {
     quick
 }
 
-/// Mounted drives shown under This PC: (path, display name). The filesystem root first, then
-/// everything mounted under /mnt, /media/<user> and /run/media/<user>.
-/// One block-device partition as reported by `lsblk`, mounted or not.
+/// One block-device partition (or whole-disk filesystem) as reported by `lsblk`.
 struct BlockDevice {
     /// `/dev/sdXN` or similar.
     path: String,
-    /// The filesystem label if it has one, else the bare device name (`sda1`).
+    /// What the drive is called: its filesystem label, else `sdb3 (393.9G)`.
     label: String,
+    /// Where it is mounted, if it is.
     mountpoint: Option<PathBuf>,
+    /// Whether `udisksctl mount` can be expected to handle it (it has a filesystem).
+    mountable: bool,
+}
+
+/// One mounted filesystem from `/proc/self/mountinfo`.
+struct MountEntry {
+    point: PathBuf,
+    /// The mount source, e.g. `/dev/sdb3` (canonicalised when it is a `/dev` node).
+    source: String,
+}
+
+/// Decode the `\040`-style octal escapes used by the kernel in `/proc/*/mountinfo`.
+fn unescape_mount_field(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\'
+            && i + 3 < bytes.len()
+            && bytes[i + 1..=i + 3].iter().all(|b| (b'0'..=b'7').contains(b))
+        {
+            let value = u32::from(bytes[i + 1] - b'0') * 64
+                + u32::from(bytes[i + 2] - b'0') * 8
+                + u32::from(bytes[i + 3] - b'0');
+            if let Ok(byte) = u8::try_from(value) {
+                out.push(byte);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Decode the `\xNN` escapes `lsblk -P` uses for spaces and other special characters.
+fn unescape_lsblk(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\'
+            && bytes.get(i + 1) == Some(&b'x')
+            && let Some(hex) = raw.get(i + 2..i + 4)
+            && let Ok(byte) = u8::from_str_radix(hex, 16)
+        {
+            out.push(byte);
+            i += 4;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn canonical_device(source: &str) -> String {
+    if source.starts_with("/dev/") {
+        fs::canonicalize(source)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| source.to_owned())
+    } else {
+        source.to_owned()
+    }
+}
+
+/// What is really mounted right now. Unlike listing directories under `/mnt`, this cannot
+/// mistake a leftover, empty mount-point directory for a drive.
+fn mount_table() -> Vec<MountEntry> {
+    let Ok(text) = fs::read_to_string("/proc/self/mountinfo") else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            // `36 35 98:0 /root /mnt/point rw,noatime master:1 - ext4 /dev/sdb3 rw`
+            let (before, after) = line.split_once(" - ")?;
+            let point = unescape_mount_field(before.split(' ').nth(4)?);
+            let source = unescape_mount_field(after.split(' ').nth(1)?);
+            Some(MountEntry {
+                point: PathBuf::from(point),
+                source: canonical_device(&source),
+            })
+        })
+        .collect()
 }
 
 /// Parse one `lsblk -P` line of space-separated `KEY="VALUE"` pairs. Values from lsblk
@@ -4262,48 +4486,150 @@ fn parse_lsblk_pairs(line: &str) -> std::collections::HashMap<String, String> {
     map
 }
 
-/// Every formatted, non-swap partition `lsblk` knows about, mounted or not. Used to show
-/// drives in This PC before the user has mounted them, and to find the device backing a
-/// Mount/Unmount request.
-fn list_block_devices() -> Vec<BlockDevice> {
+/// Filesystem types that are containers for something else, never browsable drives.
+fn is_hidden_fstype(fstype: &str) -> bool {
+    matches!(
+        fstype,
+        "swap" | "LVM2_member" | "linux_raid_member" | "isw_raid_member" | "zfs_member"
+    )
+}
+
+/// Filesystem types `udisksctl mount` cannot mount directly (they need unlocking first).
+fn is_unmountable_fstype(fstype: &str) -> bool {
+    fstype.is_empty() || matches!(fstype, "crypto_LUKS" | "BitLocker" | "ceph_bluestore")
+}
+
+/// Filesystem types found by asking udisks, remembered so a poll every few seconds does
+/// not spawn a process per partition. An empty answer is retried after a minute.
+static FSTYPE_PROBES: LazyLock<Mutex<HashMap<String, (String, Instant)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The filesystem type of `device` according to udisks. `lsblk` only knows it when udev has
+/// probed the device (some systems run without udev, or hide it from unprivileged users),
+/// while udisks' daemon can read it regardless. With `spawn == false` only an already
+/// remembered answer is used, so UI-thread callers never wait on a process.
+fn probe_fstype(device: &str, spawn: bool) -> String {
+    const RETRY_EMPTY: Duration = Duration::from_secs(60);
+    {
+        let cache = FSTYPE_PROBES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((fstype, at)) = cache.get(device)
+            && (!fstype.is_empty() || at.elapsed() < RETRY_EMPTY || !spawn)
+        {
+            return fstype.clone();
+        }
+    }
+    if !spawn {
+        return String::new();
+    }
+    let fstype = Proc::new("timeout")
+        .args(["-k", "500ms", "3s", "udisksctl", "info", "-b", device])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| {
+            String::from_utf8_lossy(&out.stdout).lines().find_map(|line| {
+                line.trim()
+                    .strip_prefix("IdType:")
+                    .map(|value| value.trim().to_owned())
+            })
+        })
+        .unwrap_or_default();
+    FSTYPE_PROBES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(device.to_owned(), (fstype.clone(), Instant::now()));
+    fstype
+}
+
+/// Every partition (and every whole disk that carries a filesystem directly) `lsblk` knows
+/// about, mounted or not. Partitions without a recognised filesystem are included, marked as
+/// not mountable, so the user sees every partition of a connected disk. Mount state comes
+/// from `lsblk`, falling back to `/proc/self/mountinfo`.
+fn list_block_devices(mounts: &[MountEntry], probe: bool) -> Vec<BlockDevice> {
     let Ok(out) = Proc::new("timeout")
         .args([
-            "-k", "500ms", "5s", "lsblk", "-P", "-p", "-o", "PATH,FSTYPE,MOUNTPOINT,TYPE,LABEL",
+            "-k",
+            "500ms",
+            "5s",
+            "lsblk",
+            "-P",
+            "-p",
+            "-o",
+            "PATH,FSTYPE,MOUNTPOINT,TYPE,LABEL,SIZE,PKNAME,PARTTYPE",
         ])
         .output()
     else {
         return Vec::new();
     };
     let text = String::from_utf8_lossy(&out.stdout);
+    let rows: Vec<std::collections::HashMap<String, String>> =
+        text.lines().map(parse_lsblk_pairs).collect();
+    // A disk (or extended partition) that has partitions below it is a container, not a drive.
+    let mut parents: HashSet<String> = HashSet::new();
+    for row in &rows {
+        if let Some(parent) = row.get("PKNAME").filter(|p| !p.is_empty()) {
+            parents.insert(parent.clone());
+            if !parent.starts_with('/') {
+                parents.insert(format!("/dev/{parent}"));
+            }
+        }
+    }
     let mut devices = Vec::new();
-    for line in text.lines() {
-        let f = parse_lsblk_pairs(line);
-        let is_partition = matches!(
-            f.get("TYPE").map(String::as_str),
-            Some("part") | Some("disk")
-        );
-        let fstype = f.get("FSTYPE").map(String::as_str).unwrap_or("");
-        if !is_partition || fstype.is_empty() || fstype == "swap" {
+    for f in &rows {
+        if !matches!(f.get("TYPE").map(String::as_str), Some("part") | Some("disk")) {
             continue;
         }
         let Some(path) = f.get("PATH").filter(|p| !p.is_empty()).cloned() else {
             continue;
         };
-        let label = f
-            .get("LABEL")
-            .filter(|l| !l.is_empty())
-            .cloned()
-            .unwrap_or_else(|| {
-                Path::new(&path)
+        let size = f.get("SIZE").map(String::as_str).unwrap_or("");
+        if parents.contains(&path) || size == "0B" || size == "0" {
+            continue;
+        }
+        // DOS extended-partition containers.
+        if matches!(
+            f.get("PARTTYPE").map(|t| t.to_lowercase()).as_deref(),
+            Some("0x5") | Some("0xf") | Some("0x85")
+        ) {
+            continue;
+        }
+        let mut fstype = f.get("FSTYPE").cloned().unwrap_or_default();
+        let mut mountpoint = f
+            .get("MOUNTPOINT")
+            .filter(|m| m.starts_with('/'))
+            .map(PathBuf::from);
+        if mountpoint.is_none() {
+            // `lsblk` may not know the mount (btrfs subvolumes, namespaces): trust the kernel.
+            let canonical = canonical_device(&path);
+            mountpoint = mounts
+                .iter()
+                .find(|m| m.source == canonical)
+                .map(|m| m.point.clone());
+        }
+        if fstype.is_empty() && mountpoint.is_none() {
+            fstype = probe_fstype(&path, probe);
+        }
+        if is_hidden_fstype(&fstype) {
+            continue;
+        }
+        let label = match f.get("LABEL").filter(|l| !l.is_empty()) {
+            Some(label) => unescape_lsblk(label),
+            None => {
+                let node = Path::new(&path)
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.clone())
-            });
-        let mountpoint = f
-            .get("MOUNTPOINT")
-            .filter(|m| !m.is_empty())
-            .map(PathBuf::from);
+                    .unwrap_or_else(|| path.clone());
+                if size.is_empty() {
+                    node
+                } else {
+                    format!("{node} ({size})")
+                }
+            }
+        };
         devices.push(BlockDevice {
+            mountable: mountpoint.is_some() || !is_unmountable_fstype(&fstype),
             path,
             label,
             mountpoint,
@@ -4322,62 +4648,87 @@ struct Drive {
     /// mount/unmount.
     device: Option<String>,
     mounted: bool,
+    /// Whether a Mount can be attempted (always `true` once mounted).
+    mountable: bool,
 }
 
 /// Prefix used for the synthetic identity of a drive that `lsblk` reports but which
 /// isn't mounted anywhere yet.
 const UNMOUNTED_DRIVE_PREFIX: &str = "device://";
 
+/// Drives for UI-thread callers: never spawns a probe process.
 fn drives() -> Vec<Drive> {
+    drives_with(false)
+}
+
+/// Everything shown under This PC. A folder under `/mnt`, `/media/<user>` or
+/// `/run/media/<user>` only counts when something is *mounted* there (an empty leftover
+/// mount-point directory is not a drive), and every partition `lsblk` reports is listed,
+/// mounted or not. `probe` additionally asks udisks for filesystems `lsblk` cannot see;
+/// only the background drive scan passes `true`.
+fn drives_with(probe: bool) -> Vec<Drive> {
     let mut drives = vec![Drive {
         path: PathBuf::from("/"),
         name: "File System".to_owned(),
         device: None,
         mounted: true,
+        mountable: true,
     }];
+    let mounts = mount_table();
     let mut roots = vec![PathBuf::from("/mnt")];
     if let Some(user) = std::env::var_os("USER") {
         roots.push(Path::new("/media").join(&user));
         roots.push(Path::new("/run/media").join(&user));
     }
-    for root in roots {
-        let Ok(rd) = fs::read_dir(&root) else {
+    let mut seen: HashSet<PathBuf> = HashSet::from([PathBuf::from("/")]);
+    let mut user_mounts: Vec<&MountEntry> = mounts
+        .iter()
+        .filter(|m| m.point.parent().is_some_and(|parent| roots.iter().any(|r| r == parent)))
+        .collect();
+    user_mounts.sort_by(|a, b| a.point.cmp(&b.point));
+    for m in user_mounts {
+        if !seen.insert(m.point.clone()) || !m.point.is_dir() {
             continue;
-        };
-        let mut found: Vec<PathBuf> = rd
-            .flatten()
-            .map(|d| d.path())
-            .filter(|p| p.is_dir())
-            .collect();
-        found.sort();
-        for p in found {
-            let name = p
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| p.display().to_string());
-            drives.push(Drive {
-                path: p,
-                name,
-                device: None,
-                mounted: true,
-            });
         }
+        let name = m
+            .point
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| m.point.display().to_string());
+        drives.push(Drive {
+            path: m.point.clone(),
+            name,
+            device: m.source.starts_with("/dev/").then(|| m.source.clone()),
+            mounted: true,
+            mountable: true,
+        });
     }
-    let seen: std::collections::HashSet<PathBuf> = drives.iter().map(|d| d.path.clone()).collect();
-    for bd in list_block_devices() {
-        match &bd.mountpoint {
-            Some(mp) if seen.contains(mp) => continue, // already listed above
-            Some(mp) => drives.push(Drive {
-                path: mp.clone(),
-                name: bd.label,
-                device: Some(bd.path),
-                mounted: true,
-            }),
+    for bd in list_block_devices(&mounts, probe) {
+        match bd.mountpoint {
+            Some(mp) if seen.contains(&mp) => {
+                // Already listed from the mount table: just remember which device it is.
+                if let Some(d) = drives.iter_mut().find(|d| d.path == mp && d.device.is_none())
+                    && mp != Path::new("/")
+                {
+                    d.device = Some(bd.path);
+                }
+            }
+            Some(mp) => {
+                seen.insert(mp.clone());
+                drives.push(Drive {
+                    path: mp,
+                    name: bd.label,
+                    device: Some(bd.path),
+                    mounted: true,
+                    mountable: true,
+                });
+            }
             None => drives.push(Drive {
                 path: PathBuf::from(format!("{UNMOUNTED_DRIVE_PREFIX}{}", bd.path)),
                 name: bd.label,
                 device: Some(bd.path),
                 mounted: false,
+                mountable: bd.mountable,
             }),
         }
     }
@@ -4413,6 +4764,7 @@ fn this_pc_entries_from(list: Vec<Drive>) -> Vec<Entry> {
             e.name_lc = e.name.to_lowercase();
             e.device = d.device;
             e.mounted = d.mounted;
+            e.mountable = d.mountable;
             e.space = if d.mounted {
                 drive_space(&d.path)
             } else {
@@ -4439,6 +4791,7 @@ fn build_nav(user_pins: &[PathBuf], this_pc_expanded: bool) -> Vec<NavNode> {
     roots.push(NavNode::new(home.clone(), "Home", Icon::FolderHome));
     let pc: Vec<NavNode> = drives()
         .into_iter()
+        .filter(|d| d.mounted || d.mountable)
         .map(|d| {
             let icon = if d.path == Path::new("/") {
                 Icon::Drive
@@ -4657,6 +5010,7 @@ fn transfer_job(
     dest: PathBuf,
     cut: bool,
     choice: ConflictChoice,
+    permanent_replace: bool,
 ) -> JobOutcome {
     let mut outcome = JobOutcome {
         origin,
@@ -4671,10 +5025,16 @@ fn transfer_job(
         let replacing =
             choice == ConflictChoice::Replace && path_entry_exists(&wanted) && wanted != *path;
         let target = if replacing {
-            // Keep the replaced destination recoverable in the Trash before creating the new
-            // item. The Trash crate is not included in this supplied archive, so its restore
-            // identity cannot be made part of a composite Undo action safely here.
-            if let Err(error) = move_to_trash(&wanted) {
+            // `permanent-delete-on-replace` in settings.toml chooses how the original goes:
+            // removed for good, or (default) moved to the Trash so it stays recoverable. The
+            // Trash's restore identity cannot be made part of a composite Undo action safely
+            // here, so Undo only removes the new item either way.
+            let removal = if permanent_replace {
+                delete_permanently(&wanted).map_err(|error| error.to_string())
+            } else {
+                move_to_trash(&wanted)
+            };
+            if let Err(error) = removal {
                 outcome.status = Some(format!("Could not replace '{}': {error}", wanted.display()));
                 break;
             }
@@ -5806,6 +6166,15 @@ fn rotate_image_file(path: &Path, clockwise: bool) -> Result<(), String> {
     rotated.save(path).map_err(|error| error.to_string())
 }
 
+/// Remove `path` for good (no Trash). A symlink is removed itself, never followed.
+fn delete_permanently(path: &Path) -> std::io::Result<()> {
+    if fs::symlink_metadata(path)?.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
 fn trash_dir() -> PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
@@ -5934,6 +6303,7 @@ mod tests {
             destination.clone(),
             false,
             ConflictChoice::KeepBoth,
+            false,
         );
 
         assert!(
@@ -6007,6 +6377,36 @@ mod tests {
     }
 
     #[test]
+    fn mountinfo_and_lsblk_escapes_are_decoded() {
+        assert_eq!(unescape_mount_field("/mnt/My\\040Disk"), "/mnt/My Disk");
+        assert_eq!(unescape_mount_field("/plain"), "/plain");
+        assert_eq!(unescape_lsblk("My\\x20Disk"), "My Disk");
+    }
+
+    #[test]
+    fn replacing_with_permanent_delete_removes_the_original_without_trash() {
+        let temp = TestDir::new();
+        let source = temp.0.join("source").join("same.txt");
+        fs::create_dir_all(source.parent().unwrap()).expect("create source dir");
+        fs::write(&source, b"new").expect("write source");
+        let destination = temp.0.join("destination");
+        fs::create_dir(&destination).expect("create destination");
+        fs::write(destination.join("same.txt"), b"old").expect("write original");
+
+        let outcome = transfer_job(
+            temp.0.clone(),
+            vec![source],
+            destination.clone(),
+            false,
+            ConflictChoice::Replace,
+            true,
+        );
+
+        assert!(outcome.status.as_deref().is_some_and(|s| s.starts_with("Copied")));
+        assert_eq!(fs::read(destination.join("same.txt")).unwrap(), b"new");
+    }
+
+    #[test]
     fn lsblk_pairs_parse_quoted_values_and_empty_fields() {
         let f = parse_lsblk_pairs(
             r#"PATH="/dev/sdb1" FSTYPE="vfat" MOUNTPOINT="" TYPE="part" LABEL="MY USB""#,
@@ -6023,6 +6423,7 @@ mod tests {
             name: "USB".into(),
             device: Some("/dev/sdb1".into()),
             mounted: false,
+            mountable: true,
         }]);
         assert_eq!(entries.len(), 1);
         assert!(!entries[0].mounted);

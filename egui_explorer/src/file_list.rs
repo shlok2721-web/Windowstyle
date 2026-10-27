@@ -103,6 +103,7 @@ fn apply(state: &mut ExplorerState, acts: Vec<Act>) {
                         SortKey::DateModified => 140.0,
                         SortKey::Type => 120.0,
                         SortKey::Size => 80.0,
+                        SortKey::LastAccessed => 150.0,
                     };
                 }
             }
@@ -525,6 +526,40 @@ fn build_layout<'a>(st: &ExplorerState, set: &'a GroupSet, avail: Vec2) -> Layou
 
 /// Draw the item pane into the remaining space of `ui`.
 pub fn show(ui: &mut Ui, state: &mut ExplorerState) {
+    if state.in_quick_access() {
+        show_history(ui, state);
+    } else {
+        show_pane(ui, state);
+    }
+    ghost(ui);
+}
+
+/// Quick access: visited folders on top as large icons, opened files below in the view the
+/// user picked (Details by default). Each pane lists only its own kind of item.
+fn show_history(ui: &mut Ui, state: &mut ExplorerState) {
+    const CELL: Vec2 = vec2(116.0, 142.0); // the LargeIcons cell
+    let files_view = state.view;
+    let avail = ui.available_size();
+
+    state.scope = ListScope::FoldersOnly;
+    state.view = ViewMode::LargeIcons;
+    let folders = state.visible_count();
+    if folders > 0 {
+        let cols = (((avail.x - 12.0 - 8.0) / CELL.x).floor() as usize).max(1);
+        let wanted = folders.div_ceil(cols) as f32 * CELL.y + 12.0;
+        // At most half the pane, so the files always stay reachable.
+        let height = wanted.min(avail.y * 0.5).max(CELL.y.min(avail.y * 0.5));
+        ui.allocate_ui(vec2(avail.x, height), |ui| show_pane(ui, state));
+        ui.separator();
+    }
+
+    state.view = files_view;
+    state.scope = ListScope::FilesOnly;
+    show_pane(ui, state);
+    state.scope = ListScope::All;
+}
+
+fn show_pane(ui: &mut Ui, state: &mut ExplorerState) {
     // Cached: the filter/sort/group work only reruns when an input changed.
     let set = state.group_set();
     let mut renaming = state.renaming.take();
@@ -619,7 +654,6 @@ fn render(
                 });
         }
     }
-    ghost(ui);
 }
 
 /// Floating label that follows the pointer while dragging items.
@@ -895,7 +929,9 @@ fn draw_content(
 
     // ---- empty message ------------------------------------------------------
     if layout.len() == 0 && !layout.has_headers() {
-        let msg = if st.search_text.is_empty() {
+        let msg = if st.search_text.is_empty() && st.scope == ListScope::FilesOnly {
+            "No files opened yet."
+        } else if st.search_text.is_empty() {
             "This folder is empty."
         } else {
             "No items match your search."
@@ -1484,6 +1520,17 @@ fn paint_item(
                             );
                         }
                     }
+                    SortKey::LastAccessed => {
+                        if let Some(t) = e.accessed {
+                            clip.text(
+                                pos2(cr.left() + 8.0, cy),
+                                Align2::LEFT_CENTER,
+                                (st.date_format)(t),
+                                font.clone(),
+                                colors::text(),
+                            );
+                        }
+                    }
                     SortKey::Type => {
                         clip.text(
                             pos2(cr.left() + 8.0, cy),
@@ -2011,6 +2058,14 @@ fn keyboard(
         return None;
     }
     let entries = &st.entries;
+    // Quick access draws two panes. Only the one that holds the focused (or selected) item
+    // takes the arrow keys, so the folder pane does not swallow keys meant for the files.
+    if st.in_quick_access() {
+        let held = st.focus.as_ref().or_else(|| st.selection.iter().next());
+        if held.is_some_and(|f| layout.position_of(|i| &entries[i].path == f).is_none()) {
+            return None;
+        }
+    }
     let path_of = |k: usize| entries[layout.entry_idx(k)].path.clone();
 
     let (shift, up, down, left, right, home, end, pgup, pgdn) = ctx.input_mut(|i| {
