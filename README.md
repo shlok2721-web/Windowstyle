@@ -80,6 +80,7 @@ Listings and search live in memory. State is saved as one small text file, and o
 - **Back, Forward and Up**, with a recent-locations history.
 - **Navigation pane** with Quick Access, your standard folders (Desktop, Downloads, Documents, Pictures and more) and This PC.
 - **Pin any folder** to Quick Access.
+- **Quick Access as a history view.** Opening Quick Access shows your 16 most recently visited folders as large icons in two tidy rows of eight, with your 30 most recently opened files listed right underneath. The folder icons resize with the window, so it is always eight across and two rows tall, and the file list always starts directly below them.
 - **Lazy folder tree.** Branches load as you open them, so large drives stay responsive.
 
 ### Views
@@ -113,6 +114,8 @@ Eight layouts are available: **Extra large icons, Large icons, Medium icons, Sma
 - Copy path, name, folder path or file URL to the clipboard
 - Files copied in the manager can be pasted into other applications
 - **Open with…** is available from the file context menu to choose an application for a selected item
+- **Opens files the way your desktop does.** Double-click, Play and *Open with → Default* use your system's default application for each file type (the same one `xdg-open` would pick), with sensible fallbacks if it is missing. An application you chose with "Remember my choice" still takes priority.
+- **Edit** opens the file in your default text editor, so it works even if your `$EDITOR` is a terminal editor
 - Executable files have contextual **Run** and **Run in terminal** actions
 
 ### Contextual File Commands
@@ -169,7 +172,10 @@ Windowstyle follows the freedesktop.org Trash specification, so its trash is sha
 
 - Live **filter-as-you-type** in the current folder
 - Search across the current folder and all of its subfolders
-- **Fast search** through the system's `plocate` database, falling back to `find` when plocate is missing or finds nothing (tmpfs folders are walked directly). Results list folders first, shallow levels first; caches (`.cache`, `node_modules`, `.git`, ...) are skipped, and bulky application data (`.var`, browser profiles, ...) is skipped unless "Search app data" is on. `.config` and `.local` stay searchable. Search runs as you type.
+- **Fast search** through the system's `plocate` database. Folders on tmpfs are walked directly, and `find` is used when `plocate` is missing or finds nothing. Results list folders first, then shallow levels first. Caches (`.cache`, `node_modules`, `.git`, ...) are skipped, and bulky application data (`.var`, browser profiles, ...) is skipped unless "Search app data" is on. `.config` and `.local` stay searchable. Search runs as you type.
+- **Never stops too early.** A search keeps widening until it has at least 28 results, so a short word like `kokoro` is no longer limited to the one folder with that name. It goes in this order: the current folder (`plocate`, then `find`), then deeper levels from the index, then `find` inside the folders you listed as `find_allowed_depth_path` (see Configuration). Once 28 results are found it stops, so searches stay quick.
+- **Wildcards.** Type `*` to stand for "anything in between". For example, `levi*mkv` finds `15.Structuralism Levi Strauss (1080p).mkv`. Without a `*`, the text simply has to appear somewhere in the name. To search for a real `*` character, type `\*`. Matching ignores upper and lower case, and `?` is treated as a normal character.
+- **Search settings are one click away.** **View → Options** opens `search_paths.conf` straight in your default text editor.
 
 ### Properties
 
@@ -283,8 +289,31 @@ Windowstyle works on its own. These tools enable additional features:
 | Learned behavior | `~/.local/state/file-manager/behavior.txt` |
 | Thumbnail cache | `~/.cache/file-manager/` |
 | Custom icons | `~/.config/file-manager/icons/` |
+| Search rules | `~/.config/file-manager/search_paths.conf` |
 
 Standard XDG locations are respected if you have customized them.
+
+<details>
+<summary><strong>Search rules (<code>search_paths.conf</code>)</strong></summary>
+
+<br>
+
+Open it from **View → Options**. It is created with examples the first time. One rule per line; lines starting with `#` are comments. Paths may start with `~` or `$HOME`, and `--depth N` limits a rule to N levels (1 = the folder's own entries). Without `--depth`, a rule covers the whole folder tree.
+
+```
+allowed="~/.local/bin"
+banned="/mnt/backup" --depth 3
+find_allowed_depth_path="~/Documents"
+find_allowed_depth_path="~/projects" --depth 6
+```
+
+- **`allowed`**: always searched, even if the folder is not in the `plocate` index or is normally skipped.
+- **`banned`**: never searched (unless you search from inside it).
+- **`find_allowed_depth_path`**: folders where `find` may be used to fill up a search that the index could not bring to 28 results. It runs last and only inside these folders, so the extra work stays where you choose. Add the places where new or unindexed files tend to appear.
+
+Changes are picked up on the next search.
+
+</details>
 
 <details>
 <summary><strong>Using your own icons</strong></summary>
@@ -304,6 +333,7 @@ To replace an icon, place a valid PNG in that file and rename it to remove the `
 
 - Dark mode and thumbnails can be toggled from the View menu and Preferences.
 - **This PC expanded** is an option in View → Preferences related to the This PC branch state in the navigation pane.
+- **View → Options** opens the search rules file (`search_paths.conf`) in your default text editor.
 - The e-mail command can be set in the settings file.
 - Set the `FM_WRITE_STATS` environment variable to `1` to print how many bytes the application writes to disk.
 
@@ -319,7 +349,7 @@ To replace an icon, place a valid PNG in that file and rename it to remove the `
 - The address bar does not auto-complete paths
 - Ctrl and mouse wheel icon zoom is not available
 - Long names in the navigation pane are clipped rather than scrolled
-- Search covers the current folder and its subfolders: `plocate` first, then `find`, then "Not found". "Build index" opens a terminal running `sudo updatedb`.
+- Search covers the current folder and its subfolders. It keeps widening until at least 28 results exist: the current folder via `plocate` then `find`, then deeper levels via `plocate`, then `find` inside the `find_allowed_depth_path` folders of `search_paths.conf`, then "Not found". "Build index" opens a terminal running `sudo updatedb`.
 
 ---
 
@@ -348,7 +378,6 @@ Released under the [MIT License](LICENSE).
 The following interface items were visible during testing but are not currently functional in the tested build/host:
 
 - **Picture rotation:** selecting **Rotate left** displayed `RotateLeft is not available in this host`; the image remained unchanged. **Rotate right** is present in the ribbon, but its behavior was not independently verified.
-- **Folder and search options:** **View → Options → Change folder and search options** displayed `Options is not available in this host`.
 - **Preview pane status:** when a PNG preview was rendered, the pane also displayed **“No preview available.”** The contradictory status message needs correction.
 
 <div align="center">

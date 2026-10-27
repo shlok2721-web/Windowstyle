@@ -36,6 +36,9 @@ const WORKER_MESSAGES_PER_FRAME: usize = 16;
 /// Bound filesystem-event batches applied while holding the hot-tier lock per UI frame.
 const TIER_EVENT_BATCHES_PER_FRAME: usize = 16;
 const SEARCH_LIMIT: usize = 500;
+/// A search keeps widening (current folder, index below it, then `find` in the
+/// `find_allowed_depth_path` folders) until it has at least this many results.
+const SEARCH_MIN_RESULTS: usize = 28;
 /// Most folders and files listed in the Quick access history view.
 const HISTORY_LIMIT: usize = 300;
 /// Paths gathered before ranking and cutting to `SEARCH_LIMIT`.
@@ -1740,7 +1743,7 @@ impl AppCore {
                     open_with::forget(&first);
                 }
                 for p in &paths {
-                    spawn_reaped(Proc::new("xdg-open").arg(p));
+                    open_with::open_default(p);
                 }
                 true
             }
@@ -2703,7 +2706,11 @@ impl AppCore {
                                 self.status = "Couldn't start the remembered application.".into();
                             }
                         }
-                        None => spawn_reaped(Proc::new("xdg-open").arg(&path)),
+                        None => {
+                            if !open_with::open_default(&path) {
+                                self.status = "No application could be started to open it.".into();
+                            }
+                        }
                     }
                 }
             }
@@ -2838,38 +2845,68 @@ impl AppCore {
         self.status = format!("Searching for '{shown}'…");
         let filter = SearchFilter::new(self.settings.search_app_data);
         self.spawn_job(move || {
-            // Level one: the current folder only. Index first, `find` restricted to just
-            // this folder second.
-            let here_plocate = plocate_search(&root, &needle, &filter, true)
-                .ok()
-                .filter(|(found, _)| !found.is_empty());
-            let level_one = match here_plocate {
-                Some(result) => Some((result, "plocate")),
-                None => find_search(&root, &needle, &filter, true)
-                    .ok()
-                    .filter(|(found, _)| !found.is_empty())
-                    .map(|result| (result, "find")),
-            };
-            // Level two: everything further below, only once level one came up empty.
-            // Index first, `find` only once the index is exhausted.
-            let (result, source) = match level_one {
-                Some((result, source)) => (Ok(result), source),
-                None => {
-                    let below_plocate = plocate_search(&root, &needle, &filter, false)
-                        .ok()
-                        .filter(|(found, _)| !found.is_empty());
-                    match below_plocate {
-                        Some(result) => (Ok(result), "plocate"),
-                        None => (find_search(&root, &needle, &filter, false), "find"),
-                    }
+            // Keep widening until SEARCH_MIN_RESULTS are found; every stage merges into one
+            // de-duplicated list that is ranked once at the end.
+            let mut found: Vec<Entry> = Vec::new();
+            let mut truncated = false;
+            let mut sources: Vec<&'static str> = Vec::new();
+            let mut error: Option<String> = None;
+            // 1. Current folder, index first (cheap).
+            absorb_search(
+                &mut found,
+                &mut truncated,
+                &mut sources,
+                plocate_search(&root, &needle, &filter, true),
+                "plocate",
+            );
+            // 2. Current folder, `find` restricted to just this folder.
+            if found.len() < SEARCH_MIN_RESULTS {
+                absorb_search(
+                    &mut found,
+                    &mut truncated,
+                    &mut sources,
+                    find_search(&root, &needle, &filter, true),
+                    "find",
+                );
+            }
+            // 3. Everything further below, from the index (deeper than level one).
+            if found.len() < SEARCH_MIN_RESULTS {
+                absorb_search(
+                    &mut found,
+                    &mut truncated,
+                    &mut sources,
+                    plocate_search(&root, &needle, &filter, false),
+                    "plocate",
+                );
+            }
+            // 4. Still short: `find` inside the `find_allowed_depth_path` folders only.
+            if found.len() < SEARCH_MIN_RESULTS {
+                let wanted = SEARCH_MIN_RESULTS - found.len();
+                absorb_search(
+                    &mut found,
+                    &mut truncated,
+                    &mut sources,
+                    find_in_allowed_paths(&root, &needle, &filter, wanted),
+                    "find",
+                );
+            }
+            // 5. Nothing at all (e.g. a stale index): the old full `find` fallback.
+            if found.is_empty() {
+                match find_search(&root, &needle, &filter, false) {
+                    Ok(result) => absorb_search(
+                        &mut found,
+                        &mut truncated,
+                        &mut sources,
+                        Ok(result),
+                        "find",
+                    ),
+                    Err(message) => error = Some(message),
                 }
-            };
-            let (found, message) = match result {
-                Ok((found, truncated)) => {
-                    let message = search_message(found.len(), &shown, source, truncated);
-                    (found, message)
-                }
-                Err(message) => (Vec::new(), message),
+            }
+            let (found, truncated) = rank_results(found, &root, &needle, truncated);
+            let message = match error {
+                Some(message) if found.is_empty() => message,
+                _ => search_message(found.len(), &shown, &sources.join(" + "), truncated),
             };
             JobOutcome {
                 origin: root.clone(),
@@ -3319,7 +3356,7 @@ impl AppCore {
                 let _ = load_search_rules();
                 match search_rules_path() {
                     Some(path) => {
-                        if open_in_editor(&path) {
+                        if open_with::open_in_default_text_editor(&path) {
                             self.status = format!("Opened {} for editing.", path.display());
                         } else {
                             self.status =
@@ -3342,7 +3379,7 @@ impl AppCore {
                     self.status = "Nothing selected to play.".into();
                 } else {
                     for path in &targets {
-                        spawn_reaped(Proc::new("xdg-open").arg(path));
+                        open_with::open_default(path);
                     }
                 }
             }
@@ -5238,6 +5275,9 @@ const SEARCH_RULES_EXAMPLE: &str = "\
 #   - allowed always wins: it is searched even if the folder is not in the plocate index,
 #     is a built-in skipped folder (.cache, node_modules, app data ...) or is also banned.
 #   - banned folders are never searched, unless you search from inside them.
+#   - find_allowed_depth_path=\"/path\" [--depth N]: folders where `find` may be used to top
+#     up a search that plocate (the index) could not fill to 28 results. It runs last, only
+#     when needed, and only inside these folders (no --depth = the whole folder tree).
 #
 # Examples (remove the leading # to use them):
 #
@@ -5246,6 +5286,8 @@ const SEARCH_RULES_EXAMPLE: &str = "\
 # allowed=\"~/.cache/myapp\"
 # banned=\"~/Downloads/huge-dump\"
 # banned=\"/mnt/backup\" --depth 3
+# find_allowed_depth_path=\"~/Documents\"
+# find_allowed_depth_path=\"~/projects\" --depth 6
 ";
 
 fn search_rules_path() -> Option<PathBuf> {
@@ -5254,16 +5296,25 @@ fn search_rules_path() -> Option<PathBuf> {
         .map(|dir| dir.join("search_paths.conf"))
 }
 
-/// Parse one line; `Some((is_allowed, rule))` for a valid rule.
-fn parse_search_rule(line: &str) -> Option<(bool, SearchRule)> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuleKind {
+    Allowed,
+    Banned,
+    /// Folder where `find` may top up a search the index could not fill.
+    FindAllowed,
+}
+
+/// Parse one line; `Some((kind, rule))` for a valid rule.
+fn parse_search_rule(line: &str) -> Option<(RuleKind, SearchRule)> {
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') {
         return None;
     }
     let (key, rest) = line.split_once('=')?;
-    let allowed = match key.trim().to_ascii_lowercase().as_str() {
-        "allowed" => true,
-        "banned" => false,
+    let kind = match key.trim().to_ascii_lowercase().as_str() {
+        "allowed" => RuleKind::Allowed,
+        "banned" => RuleKind::Banned,
+        "find_allowed_depth_path" => RuleKind::FindAllowed,
         _ => return None,
     };
     let rest = rest.trim_start();
@@ -5304,14 +5355,14 @@ fn parse_search_rule(line: &str) -> Option<(bool, SearchRule)> {
         return None;
     }
     let path = fs::canonicalize(&path).unwrap_or(path);
-    Some((allowed, SearchRule { path, depth }))
+    Some((kind, SearchRule { path, depth }))
 }
 
 /// Read `search_paths.conf` (creating it with examples the first time).
-fn load_search_rules() -> (Vec<SearchRule>, Vec<SearchRule>) {
-    let (mut allowed, mut banned) = (Vec::new(), Vec::new());
+fn load_search_rules() -> (Vec<SearchRule>, Vec<SearchRule>, Vec<SearchRule>) {
+    let (mut allowed, mut banned, mut find_allowed) = (Vec::new(), Vec::new(), Vec::new());
     let Some(file) = search_rules_path() else {
-        return (allowed, banned);
+        return (allowed, banned, find_allowed);
     };
     let text = match fs::read_to_string(&file) {
         Ok(text) => text,
@@ -5320,18 +5371,19 @@ fn load_search_rules() -> (Vec<SearchRule>, Vec<SearchRule>) {
                 let _ = fs::create_dir_all(dir);
             }
             let _ = fs::write(&file, SEARCH_RULES_EXAMPLE);
-            return (allowed, banned);
+            return (allowed, banned, find_allowed);
         }
-        Err(_) => return (allowed, banned),
+        Err(_) => return (allowed, banned, find_allowed),
     };
     for line in text.lines() {
         match parse_search_rule(line) {
-            Some((true, rule)) => allowed.push(rule),
-            Some((false, rule)) => banned.push(rule),
+            Some((RuleKind::Allowed, rule)) => allowed.push(rule),
+            Some((RuleKind::Banned, rule)) => banned.push(rule),
+            Some((RuleKind::FindAllowed, rule)) => find_allowed.push(rule),
             None => {}
         }
     }
-    (allowed, banned)
+    (allowed, banned, find_allowed)
 }
 
 /// Folders the search ignores: caches and clutter always, application data unless enabled.
@@ -5343,6 +5395,8 @@ struct SearchFilter {
     /// Banned folders limited by `--depth` (unlimited ones live in `skip_paths`, which also
     /// lets the walkers prune them).
     banned_depth: Vec<SearchRule>,
+    /// `find_allowed_depth_path` folders: the only places `find` tops up a short result list.
+    find_allowed: Vec<SearchRule>,
 }
 
 impl SearchFilter {
@@ -5354,7 +5408,7 @@ impl SearchFilter {
                 skip_paths.extend(SEARCH_SKIP_APP_DATA.iter().map(|p| home.join(p)));
             }
         }
-        let (allowed, banned) = load_search_rules();
+        let (allowed, banned, find_allowed) = load_search_rules();
         let mut banned_depth = Vec::new();
         for rule in banned {
             if rule.depth.is_none() {
@@ -5367,6 +5421,7 @@ impl SearchFilter {
             skip_paths,
             allowed,
             banned_depth,
+            find_allowed,
         }
     }
 
@@ -5439,6 +5494,7 @@ impl SearchFilter {
 /// Walk `base` without any skip rule, collecting names containing `needle`. `levels` limits
 /// how many directory levels are read (1 = only `base`'s own entries).
 fn walk_allowed(base: &Path, levels: Option<u32>, needle: &str, found: &mut Vec<Entry>) {
+    let pattern = egui_explorer::NamePattern::parse(needle);
     let mut stack: Vec<(PathBuf, u32)> = vec![(base.to_path_buf(), 1)];
     while let Some((dir, level)) = stack.pop() {
         let Ok(read) = fs::read_dir(&dir) else {
@@ -5451,7 +5507,7 @@ fn walk_allowed(base: &Path, levels: Option<u32>, needle: &str, found: &mut Vec<
             };
             let is_dir = file_type.is_dir();
             let shown_as_dir = is_dir || (file_type.is_symlink() && path.is_dir());
-            if item.file_name().to_string_lossy().to_lowercase().contains(needle) {
+            if pattern.matches(&item.file_name().to_string_lossy().to_lowercase()) {
                 let mut e = Entry::new(
                     &path,
                     if shown_as_dir {
@@ -5511,11 +5567,12 @@ fn rank_results(
     raw_truncated: bool,
 ) -> (Vec<Entry>, bool) {
     let base = root.components().count();
+    let first = egui_explorer::NamePattern::parse(needle).first().to_owned();
     found.sort_by_cached_key(|e| {
         (
             !e.is_dir(),
             e.path.components().count().saturating_sub(base),
-            !e.name_lc.starts_with(needle),
+            !e.name_lc.starts_with(first.as_str()),
             e.name_lc.clone(),
         )
     });
@@ -5547,6 +5604,7 @@ fn collect_paths(
     separator: u8,
     filter: &SearchFilter,
     immediate_only: bool,
+    matcher: Option<&egui_explorer::NamePattern>,
 ) -> (Vec<Entry>, bool, String) {
     use std::io::{BufRead, BufReader};
     use std::os::unix::ffi::OsStrExt;
@@ -5557,6 +5615,15 @@ fn collect_paths(
             let path = PathBuf::from(std::ffi::OsStr::from_bytes(&line));
             if path == root || !path.starts_with(root) || filter.skips(&path, root) {
                 continue;
+            }
+            if let Some(matcher) = matcher {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_lowercase())
+                    .unwrap_or_default();
+                if !matcher.matches(&name) {
+                    continue;
+                }
             }
             // Level-one search: only entries directly inside `root`, not any deeper.
             if immediate_only && path.parent() != Some(root) {
@@ -5594,15 +5661,21 @@ fn plocate_search(
 ) -> Result<(Vec<Entry>, bool), String> {
     use std::process::Stdio;
     let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let pattern = egui_explorer::NamePattern::parse(needle);
+    // The index is asked for the longest literal piece; `collect_paths` then applies the
+    // full pattern (wildcards included) to each name.
+    let Some(term) = pattern.index_term() else {
+        return Ok((Vec::new(), false));
+    };
     let child = Proc::new("plocate")
         .args(["-i", "-b", "-e", "--"])
-        .arg(needle)
+        .arg(term)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("Could not run plocate: {error}"))?;
     let (mut found, truncated, stderr) =
-        collect_paths(child, &root, b'\n', filter, immediate_only);
+        collect_paths(child, &root, b'\n', filter, immediate_only, Some(&pattern));
     // Allowed folders are read directly (they may be missing from the index).
     merge_unique(&mut found, filter.allowed_entries(&root, needle, immediate_only));
     if found.is_empty() && !stderr.is_empty() {
@@ -5618,6 +5691,101 @@ fn plocate_search(
 /// index has nothing there. Otherwise (level two) it searches everything below `root`,
 /// starting shallow and only going deeper while there are few results, so shallow matches
 /// win.
+/// The `find` command for names matching `pattern` below `base` (ignored folders are listed
+/// when their own name matches but not entered). `depth` is `-maxdepth`.
+fn find_command(
+    base: &Path,
+    pattern: &str,
+    conditions: &[(&str, String)],
+    depth: Option<u32>,
+) -> Proc {
+    let mut command = Proc::new("find");
+    command.arg(base);
+    if let Some(depth) = depth {
+        command.arg("-maxdepth").arg(depth.to_string());
+    }
+    command.args(["-mindepth", "1", "(", "-type", "d", "("]);
+    for (i, (flag, value)) in conditions.iter().enumerate() {
+        if i > 0 {
+            command.arg("-o");
+        }
+        command.arg(flag).arg(value);
+    }
+    command.args(["(", "(", "-iname"]).arg(pattern);
+    command.args([")", "-print0", "-o", "-true", ")", "-prune", ")", "-o", "-iname"]);
+    command.arg(pattern).arg("-print0");
+    command
+}
+
+/// Top-up search: `find` inside the `find_allowed_depth_path` folders that overlap `root`
+/// (depth-limited when the rule has `--depth`), stopping once `wanted` results exist.
+fn find_in_allowed_paths(
+    root: &Path,
+    needle: &str,
+    filter: &SearchFilter,
+    wanted: usize,
+) -> Result<(Vec<Entry>, bool), String> {
+    use std::process::Stdio;
+    let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let pattern = egui_explorer::NamePattern::parse(needle).glob();
+    let mut conditions: Vec<(&str, String)> = SEARCH_SKIP_NAMES
+        .iter()
+        .map(|name| ("-name", (*name).to_owned()))
+        .collect();
+    for path in filter.active_paths(&root) {
+        conditions.push(("-path", glob_escape(&path.to_string_lossy())));
+    }
+    let mut found: Vec<Entry> = Vec::new();
+    let mut truncated = false;
+    for rule in &filter.find_allowed {
+        let (base, depth) = if root.starts_with(&rule.path) {
+            // Searching inside the allowed folder: only its remaining depth applies.
+            let used = rule.level_of(&root).unwrap_or(0) as u32;
+            (root.clone(), rule.depth.map(|n| n.saturating_sub(used)))
+        } else if rule.path.starts_with(&root) {
+            (rule.path.clone(), rule.depth)
+        } else {
+            continue;
+        };
+        if depth == Some(0) {
+            continue;
+        }
+        let child = find_command(&base, &pattern, &conditions, depth)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("Could not run find: {error}"))?;
+        let (entries, cut, _) = collect_paths(child, &root, 0, filter, false, None);
+        truncated |= cut;
+        merge_unique(&mut found, entries);
+        if found.len() >= wanted {
+            break;
+        }
+    }
+    Ok((found, truncated))
+}
+
+/// Merge one search stage into the running result list.
+fn absorb_search(
+    found: &mut Vec<Entry>,
+    truncated: &mut bool,
+    sources: &mut Vec<&'static str>,
+    result: Result<(Vec<Entry>, bool), String>,
+    source: &'static str,
+) {
+    let Ok((entries, cut)) = result else {
+        return;
+    };
+    if entries.is_empty() {
+        return;
+    }
+    *truncated |= cut;
+    merge_unique(found, entries);
+    if !sources.contains(&source) {
+        sources.push(source);
+    }
+}
+
 fn find_search(
     root: &Path,
     needle: &str,
@@ -5625,7 +5793,7 @@ fn find_search(
     immediate_only: bool,
 ) -> Result<(Vec<Entry>, bool), String> {
     use std::process::Stdio;
-    let pattern = format!("*{}*", glob_escape(needle));
+    let pattern = egui_explorer::NamePattern::parse(needle).glob();
     let mut conditions: Vec<(&str, String)> = SEARCH_SKIP_NAMES
         .iter()
         .map(|name| ("-name", (*name).to_owned()))
@@ -5641,28 +5809,13 @@ fn find_search(
     let mut last = (Vec::new(), false);
     let allowed_found = filter.allowed_entries(root, needle, immediate_only);
     for &depth in depths {
-        let mut command = Proc::new("find");
-        command.arg(root);
-        if let Some(depth) = depth {
-            command.arg("-maxdepth").arg(depth.to_string());
-        }
-        command.args(["-mindepth", "1", "(", "-type", "d", "("]);
-        for (i, (flag, value)) in conditions.iter().enumerate() {
-            if i > 0 {
-                command.arg("-o");
-            }
-            command.arg(flag).arg(value);
-        }
-        // Ignored folders are still listed when their own name matches, but not entered.
-        command.args(["(", "(", "-iname"]).arg(&pattern);
-        command.args([")", "-print0", "-o", "-true", ")", "-prune", ")", "-o", "-iname"]);
-        command.arg(&pattern).arg("-print0");
+        let mut command = find_command(root, &pattern, &conditions, depth);
         let child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .map_err(|error| format!("Could not run find: {error}"))?;
-        let (mut found, truncated, _) = collect_paths(child, root, 0, filter, immediate_only);
+        let (mut found, truncated, _) = collect_paths(child, root, 0, filter, immediate_only, None);
         merge_unique(&mut found, allowed_found.clone());
         let enough = found.len() >= 100 || truncated;
         last = rank_results(found, root, needle, truncated);
@@ -5674,6 +5827,7 @@ fn find_search(
 }
 
 fn walk_search(root: &Path, needle: &str, filter: &SearchFilter) -> (Vec<Entry>, bool) {
+    let pattern = egui_explorer::NamePattern::parse(needle);
     let mut found: Vec<Entry> = Vec::new();
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
     let mut truncated = false;
@@ -5691,7 +5845,7 @@ fn walk_search(root: &Path, needle: &str, filter: &SearchFilter) -> (Vec<Entry>,
             // into, so link loops still cannot occur.
             let shown_as_dir = is_dir || (file_type.is_symlink() && path.is_dir());
             let name = item.file_name().to_string_lossy().to_lowercase();
-            if name.contains(needle) && !filter.skips(&path, root) {
+            if pattern.matches(&name) && !filter.skips(&path, root) {
                 let mut e = Entry::new(
                     &path,
                     if shown_as_dir {
@@ -6111,21 +6265,24 @@ fn file_url(path: &Path) -> String {
     out
 }
 
-/// Open a file in `$VISUAL` / `$EDITOR`, then common GUI editors, then `xdg-open`.
+/// Open a file in the user's default text editor (the desktop's handler for plain text),
+/// then `xdg-open`, then common GUI editors, and `$VISUAL` / `$EDITOR` last (those are often
+/// terminal editors that cannot start without a terminal).
 /// Spawns without blocking; returns whether anything started.
 fn open_in_editor(path: &Path) -> bool {
+    if open_with::open_in_default_text_editor(path) {
+        return true;
+    }
     let mut candidates: Vec<String> = Vec::new();
+    for name in ["gedit", "kate", "xed", "mousepad", "pluma", "code"] {
+        candidates.push(name.to_string());
+    }
     for var in ["VISUAL", "EDITOR"] {
         if let Ok(value) = std::env::var(var)
             && !value.trim().is_empty()
         {
             candidates.push(value);
         }
-    }
-    for name in [
-        "gedit", "kate", "xed", "mousepad", "pluma", "code", "xdg-open",
-    ] {
-        candidates.push(name.to_string());
     }
     for candidate in candidates {
         let mut parts = candidate.split_whitespace();

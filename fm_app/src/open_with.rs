@@ -182,6 +182,80 @@ pub fn handlers_for<'a>(apps: &'a [AppEntry], mime: &str) -> Vec<&'a AppEntry> {
     list
 }
 
+/// The desktop's default application for `mime`: `xdg-mime query default` first (it follows
+/// every mimeapps.list the desktop uses), then our own reading of `mimeapps.list`.
+pub fn default_app(mime: &str) -> Option<AppEntry> {
+    let mut ids: Vec<String> = Proc::new("xdg-mime")
+        .args(["query", "default", mime])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        .filter(|id| !id.is_empty())
+        .into_iter()
+        .collect();
+    ids.extend(system_defaults(mime));
+    let apps = all_apps();
+    ids.iter()
+        .find_map(|id| apps.iter().find(|a| a.id == *id).cloned())
+}
+
+fn spawn_quiet(program: &str, args: &[&Path]) -> bool {
+    let mut command = Proc::new(program);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    match command.spawn() {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Open `path` with the desktop's default application: `xdg-open`, then `gio open`, then the
+/// default handler for its MIME type resolved by hand. Returns whether anything started.
+pub fn open_default(path: &Path) -> bool {
+    if spawn_quiet("xdg-open", &[path]) {
+        return true;
+    }
+    {
+        let mut command = Proc::new("gio");
+        command
+            .arg("open")
+            .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Ok(mut child) = command.spawn() {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            return true;
+        }
+    }
+    default_app(&mime_for(path)).is_some_and(|app| launch(&app, &[path.to_path_buf()]))
+}
+
+/// Open `path` in the text editor the user set as default for plain text (so a `.conf` file
+/// opens in their editor even when `.conf` has no handler of its own), falling back to
+/// `open_default`.
+pub fn open_in_default_text_editor(path: &Path) -> bool {
+    if let Some(app) = default_app("text/plain")
+        && launch(&app, &[path.to_path_buf()])
+    {
+        return true;
+    }
+    open_default(path)
+}
+
 /// Desktop ids listed under `[Default Applications]` / `[Added Associations]` for `mime`.
 fn system_defaults(mime: &str) -> Vec<String> {
     let mut files = Vec::new();
