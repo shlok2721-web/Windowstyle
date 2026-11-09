@@ -266,8 +266,16 @@ jobs:
           fi
 
           for f in *.tar.gz; do
-            tar -tzf "$f" | grep -qx 'file-manager' \
-              || { echo "$f does not contain the file-manager executable" >&2; exit 1; }
+            # List first, search after. `tar -tzf | grep -q` fails under pipefail: grep exits
+            # at its first match, tar then hits a closed pipe ("stdout: write error") and the
+            # pipeline reports failure even though the file is present.
+            listing="$(tar -tzf "$f")"
+            # Accept both `file-manager` and `./file-manager` entry names.
+            if ! grep -Eqx '(\./)?file-manager' <<< "$listing"; then
+              echo "$f does not contain the file-manager executable. Contents:" >&2
+              echo "$listing" >&2
+              exit 1
+            fi
           done
 
           sha256sum *.tar.gz > SHA256SUMS-distros.txt

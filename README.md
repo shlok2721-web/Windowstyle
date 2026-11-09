@@ -286,12 +286,31 @@ Windowstyle works on its own. These tools enable additional features:
 | Item | Location |
 |---|---|
 | Settings | `~/.config/file-manager/settings.toml` |
+| Remembered layout and per-folder views | `~/.config/file-manager/session.toml` |
 | Learned behavior | `~/.local/state/file-manager/behavior.txt` |
 | Thumbnail cache | `~/.cache/file-manager/` |
 | Custom icons | `~/.config/file-manager/icons/` |
 | Search rules | `~/.config/file-manager/search_paths.conf` |
 
 Standard XDG locations are respected if you have customized them.
+
+`settings.toml` changes only when you change it: by hand (the running app re-reads it within a couple of seconds), or by an explicit action in the app such as a toggle or renaming a drive. Things the app tracks on its own while you browse (the layout and ribbon state kept by `view.remember` / `ribbon.remember`, and per-folder views) go to `session.toml` instead.
+
+```toml
+# Normal delete (Delete key, ribbon, context menu) moves items to the Trash.
+# false: every delete is permanent (with a confirmation), including "Replace" on copy/move.
+delete_moveto_trash = true
+
+# Also write a drive's new name to the filesystem label when you rename it in the app
+# (through udisks, no password for the local session; NTFS needs ntfs-3g and an unmounted drive).
+drive-rename-on-disk = false
+
+# Names shown for drives, keyed by filesystem UUID. Set with F2 on a drive in This PC.
+[drive-names]
+"1234-ABCD" = "Backup"
+```
+
+Drives that are connected but not mounted (found with `lsblk`) are listed under This PC; mounting one keeps the name it had.
 
 <details>
 <summary><strong>Search rules (<code>search_paths.conf</code>)</strong></summary>

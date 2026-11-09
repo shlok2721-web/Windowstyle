@@ -1240,6 +1240,7 @@ fn item_menu(
             } else {
                 M::item("Mount", C::MountDrive)
             },
+            M::item("Rename", C::Rename).key("F2"),
             M::Sep,
             M::item("Pin to Quick access", C::PinToQuickAccess).icon(I::Pin),
             M::Sep,

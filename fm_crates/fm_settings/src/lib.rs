@@ -308,6 +308,22 @@ pub struct Settings {
     /// original permanently instead of sending it to the Trash. Off by default.
     #[serde(default, rename = "permanent-delete-on-replace")]
     pub permanent_delete_on_replace: bool,
+    /// What a normal delete does. `true` (default): items go to the Trash and can be
+    /// restored. `false`: every kind of delete (Delete key, ribbon, context menu, and
+    /// replacing on copy/move) removes items permanently, after a confirmation prompt.
+    /// Deleting from inside the Trash is always permanent.
+    #[serde(default = "yes", rename = "delete_moveto_trash")]
+    pub delete_moveto_trash: bool,
+    /// Names shown for drives in the file manager, keyed by the drive's UUID (or its
+    /// device node when it has none). View-only: the disk itself is not touched unless
+    /// `drive_rename_on_disk` is on. Set in the app (F2 on a drive) or edit by hand.
+    #[serde(default, rename = "drive-names")]
+    pub drive_names: BTreeMap<String, String>,
+    /// When renaming a drive in the app, also write the new label to the filesystem
+    /// through udisks (polkit allows this without a password for the active local
+    /// session; NTFS needs `ntfs-3g` installed and the drive unmounted). Off by default.
+    #[serde(default, rename = "drive-rename-on-disk")]
+    pub drive_rename_on_disk: bool,
     /// Maximum thumbnail edge in pixels. Invalid values are clamped by the consumer.
     #[serde(default = "default_thumbnail_edge")]
     pub thumbnail_edge: u32,
@@ -344,6 +360,9 @@ impl Default for Settings {
             dark_mode: false,
             search_app_data: false,
             permanent_delete_on_replace: false,
+            delete_moveto_trash: true,
+            drive_names: BTreeMap::new(),
+            drive_rename_on_disk: false,
             thumbnail_edge: 256,
             navigation_icon_size: default_navigation_icon_size(),
             email_command: default_email_command(),
@@ -426,69 +445,11 @@ impl Settings {
 
     /// Atomic save (write a unique temporary file, then rename); unchanged
     /// settings are not rewritten. Parent directories are created as needed.
+    ///
+    /// The app calls this only for changes the user makes on purpose (a toggle, a drive
+    /// rename). Values that change as a side effect of browsing live in [`Session`].
     pub fn save(&self, path: &Path) -> Result<(), SettingsError> {
-        use std::io::Write;
-
-        let text = self.to_toml()?;
-        match std::fs::read(path) {
-            Ok(existing) if existing == text.as_bytes() => return Ok(()),
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(SettingsError::Io(e)),
-        }
-
-        // Atomic replacement otherwise resets an existing file's mode to the
-        // process umask defaults. Preserve permissions for regular settings files.
-        // Do not copy symlink metadata: `rename` replaces the link itself.
-        let existing_permissions = match std::fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.file_type().is_file() => Some(metadata.permissions()),
-            Ok(_) => None,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(SettingsError::Io(e)),
-        };
-
-        let parent = path.parent().filter(|d| !d.as_os_str().is_empty());
-        if let Some(dir) = parent {
-            std::fs::create_dir_all(dir).map_err(SettingsError::Io)?;
-        }
-        let file_name = path.file_name().unwrap_or_default().to_string_lossy();
-        let (tmp, mut file) = loop {
-            let suffix = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-            let name = format!(".{file_name}.tmp-{}-{suffix}", std::process::id());
-            let candidate = parent.map_or_else(|| PathBuf::from(&name), |d| d.join(&name));
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&candidate)
-            {
-                Ok(file) => break (candidate, file),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(SettingsError::Io(e)),
-            }
-        };
-        let write_result = (|| {
-            file.write_all(text.as_bytes())?;
-            if let Some(permissions) = existing_permissions {
-                file.set_permissions(permissions)?;
-            }
-            file.sync_all()
-        })();
-        if let Err(e) = write_result {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(SettingsError::Io(e));
-        }
-        drop(file);
-        if let Err(e) = std::fs::rename(&tmp, path) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(SettingsError::Io(e));
-        }
-        #[cfg(unix)]
-        if let Some(dir) = parent
-            && let Ok(handle) = std::fs::File::open(dir)
-        {
-            handle.sync_all().map_err(SettingsError::Io)?;
-        }
-        Ok(())
+        atomic_write(path, &self.to_toml()?)
     }
 
     pub fn folder_view(&self, folder: &Path) -> Option<&FolderView> {
@@ -514,6 +475,148 @@ impl Settings {
             .unwrap_or_else(|| non_unicode_folder_key(folder));
         self.per_folder.insert(key, v);
     }
+}
+
+/// Values the app changes by itself while you use it: the layout and ribbon state it
+/// remembers (`view.remember` / `ribbon.remember`) and per-folder views. They live in
+/// `session.toml`, next to `settings.toml`, so `settings.toml` stays exactly as you wrote
+/// it and changes only when you change it (by hand, or by an explicit action in the app).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Session {
+    /// Last layout used; applied at start only when `view.remember = true`.
+    pub view_mode: Option<ViewMode>,
+    /// Last ribbon state; applied at start only when `ribbon.remember = true`.
+    pub ribbon_mode: Option<RibbonMode>,
+    /// Folder (as string path) -> remembered view.
+    pub per_folder: BTreeMap<String, FolderView>,
+}
+
+impl Session {
+    /// Load `path`. A missing or unreadable file gives an empty session: it only holds
+    /// conveniences, so a damaged file is never worth failing the start over.
+    pub fn load(path: &Path) -> Self {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| toml::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    /// Atomic save; unchanged content is not rewritten.
+    pub fn save(&self, path: &Path) -> Result<(), SettingsError> {
+        let text = toml::to_string_pretty(self).map_err(SettingsError::Serialize)?;
+        atomic_write(path, &text)
+    }
+
+    pub fn folder_view(&self, folder: &Path) -> Option<&FolderView> {
+        self.per_folder.get(&folder_key(folder))
+    }
+
+    pub fn set_folder_view(&mut self, folder: &Path, v: FolderView) {
+        self.per_folder.insert(folder_key(folder), v);
+    }
+}
+
+impl Settings {
+    /// The settings as they apply right now: `settings.toml` with the remembered layout,
+    /// ribbon state and per-folder views from `session` laid over it. In-memory only; never
+    /// save the result.
+    pub fn effective(&self, session: &Session) -> Settings {
+        let mut out = self.clone();
+        if out.view.remember
+            && let Some(mode) = session.view_mode
+        {
+            out.view.mode = mode;
+        }
+        if out.ribbon.remember
+            && let Some(mode) = session.ribbon_mode
+        {
+            out.ribbon.mode = mode;
+        }
+        for (key, view) in &session.per_folder {
+            out.per_folder.insert(key.clone(), view.clone());
+        }
+        out
+    }
+}
+
+/// The map key for `folder` (shared by [`Settings`] and [`Session`]).
+fn folder_key(folder: &Path) -> String {
+    match folder.to_str() {
+        Some(path) if uses_reserved_folder_key_prefix(path) => escape_text_folder_key(path),
+        Some(path) => path.to_owned(),
+        None => non_unicode_folder_key(folder),
+    }
+}
+
+/// `$XDG_CONFIG_HOME/<app>/session.toml`, beside `settings.toml`.
+pub fn session_path_for(settings_path: &Path) -> PathBuf {
+    settings_path.with_file_name("session.toml")
+}
+
+/// Replace `path` with `text` atomically; identical content is not rewritten.
+fn atomic_write(path: &Path, text: &str) -> Result<(), SettingsError> {
+    use std::io::Write;
+
+    match std::fs::read(path) {
+        Ok(existing) if existing == text.as_bytes() => return Ok(()),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(SettingsError::Io(e)),
+    }
+
+    // Atomic replacement otherwise resets an existing file's mode to the
+    // process umask defaults. Preserve permissions for regular settings files.
+    // Do not copy symlink metadata: `rename` replaces the link itself.
+    let existing_permissions = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Some(metadata.permissions()),
+        Ok(_) => None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(SettingsError::Io(e)),
+    };
+
+    let parent = path.parent().filter(|d| !d.as_os_str().is_empty());
+    if let Some(dir) = parent {
+        std::fs::create_dir_all(dir).map_err(SettingsError::Io)?;
+    }
+    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+    let (tmp, mut file) = loop {
+        let suffix = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let name = format!(".{file_name}.tmp-{}-{suffix}", std::process::id());
+        let candidate = parent.map_or_else(|| PathBuf::from(&name), |d| d.join(&name));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => break (candidate, file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(SettingsError::Io(e)),
+        }
+    };
+    let write_result = (|| {
+        file.write_all(text.as_bytes())?;
+        if let Some(permissions) = existing_permissions {
+            file.set_permissions(permissions)?;
+        }
+        file.sync_all()
+    })();
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(SettingsError::Io(e));
+    }
+    drop(file);
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(SettingsError::Io(e));
+    }
+    #[cfg(unix)]
+    if let Some(dir) = parent
+        && let Ok(handle) = std::fs::File::open(dir)
+    {
+        handle.sync_all().map_err(SettingsError::Io)?;
+    }
+    Ok(())
 }
 
 const NON_UNICODE_FOLDER_PREFIX: &str = "@windowstyle:raw-path-bytes:";
@@ -842,5 +945,51 @@ mod tests {
         settings.save(&path).unwrap();
 
         assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn delete_to_trash_defaults_on_and_parses() {
+        assert!(Settings::default().delete_moveto_trash);
+        assert!(Settings::from_toml("").unwrap().delete_moveto_trash);
+        let s = Settings::from_toml("delete_moveto_trash = false\n").unwrap();
+        assert!(!s.delete_moveto_trash);
+        assert!(Settings::from_toml(&s.to_toml().unwrap()).unwrap() == s);
+    }
+
+    #[test]
+    fn drive_names_round_trip() {
+        let mut s = Settings::default();
+        s.drive_names.insert("1234-ABCD".into(), "Backup".into());
+        let back = Settings::from_toml(&s.to_toml().unwrap()).unwrap();
+        assert_eq!(back.drive_names.get("1234-ABCD").map(String::as_str), Some("Backup"));
+        assert!(!back.drive_rename_on_disk);
+    }
+
+    #[test]
+    fn session_overlays_without_touching_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.toml");
+        let session_path = session_path_for(&settings_path);
+        let mut settings = Settings::default();
+        settings.view.remember = true;
+        settings.save(&settings_path).unwrap();
+        let before = std::fs::read(&settings_path).unwrap();
+
+        let mut session = Session::load(&session_path);
+        session.view_mode = Some(ViewMode::Tiles);
+        session.set_folder_view(
+            Path::new("/home/me"),
+            FolderView { mode: ViewMode::List, ..Default::default() },
+        );
+        session.save(&session_path).unwrap();
+
+        let reloaded = Session::load(&session_path);
+        let eff = settings.effective(&reloaded);
+        assert_eq!(eff.view.mode, ViewMode::Tiles);
+        assert_eq!(eff.folder_view(Path::new("/home/me")).unwrap().mode, ViewMode::List);
+        // `remember = false` ignores the stored layout.
+        settings.view.remember = false;
+        assert_eq!(settings.effective(&reloaded).view.mode, ViewMode::Details);
+        assert_eq!(std::fs::read(&settings_path).unwrap(), before);
     }
 }

@@ -1687,7 +1687,6 @@ impl ExplorerState {
                     | Command::CopyTo
                     | Command::Delete
                     | Command::DeletePermanently
-                    | Command::Rename
                     | Command::HideSelectedItems
                     | Command::Share
                     | Command::Email
@@ -1753,7 +1752,14 @@ impl ExplorerState {
                         .first()
                         .is_some_and(|e| e.kind == EntryKind::File && is_executable_file(&e.path))
             }
-            Command::Rename => n == 1,
+            // A drive can be renamed (its display name) when the host knows its device; the
+            // host decides what that means. The root "File System" entry has no device.
+            Command::Rename => {
+                n == 1
+                    && self.selected_entries().first().is_some_and(|e| {
+                        e.kind != EntryKind::Drive || (e.device.is_some() && !self.in_trash())
+                    })
+            }
             Command::CopyName | Command::CopyUrl => n > 0,
             Command::RestoreFromTrash => n > 0 && self.in_trash(),
             Command::EmptyTrash => self.in_trash(),
