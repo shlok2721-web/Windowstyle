@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as Proc;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -24,7 +24,7 @@ use egui_explorer::{
 use fm_behav::Behavior;
 use fm_persist::{AtomicFile, FlushPolicy, Flusher, Outcome, WriteCounter};
 use fm_settings::{
-    FolderView, GroupKey as SavedGroupKey, RibbonMode as SavedRibbonMode, Settings,
+    FolderView, GroupKey as SavedGroupKey, RibbonMode as SavedRibbonMode, Session, Settings,
     SortKey as SavedSortKey, SortOrder as SavedSortOrder, ViewMode as SavedViewMode,
 };
 use fm_thumbs::{Thumbnail, ThumbnailAudit, ThumbnailGenerationReport, ThumbnailStore};
@@ -552,9 +552,21 @@ struct AppCore {
     pending_extract: Option<PendingExtract>,
     undo_stack: Vec<UndoAction>,
     redo_stack: Vec<UndoAction>,
+    /// What `settings.toml` says. Written only for changes the user makes on purpose
+    /// (a toggle, a drive rename), never for things that change as a side effect of use.
     settings: Settings,
     config_path: PathBuf,
     config_write_blocked: bool,
+    /// `session.toml`: the remembered layout / ribbon state and per-folder views, which do
+    /// change as you browse. Kept out of `settings.toml` so that file only changes when you
+    /// change it.
+    session: Session,
+    session_path: PathBuf,
+    /// Modification time of `settings.toml` as last read or written by us, to spot hand edits.
+    config_mtime: Option<std::time::SystemTime>,
+    config_reload_checked: Instant,
+    /// Drive entry path -> key its custom name is stored under (UUID, else device node).
+    drive_keys: HashMap<PathBuf, String>,
     /// `zoom.txt` next to the settings file: the interface zoom (Ctrl + / Ctrl -), remembered
     /// across runs.
     zoom_path: PathBuf,
@@ -659,6 +671,11 @@ impl AppCore {
         let config_path = fm_settings::default_config_path("file-manager")
             .unwrap_or_else(|| PathBuf::from(".config/file-manager/settings.toml"));
         let (settings, settings_error) = Settings::load_or_default(&config_path);
+        let config_mtime = fs::metadata(&config_path).and_then(|m| m.modified()).ok();
+        let session_path = fm_settings::session_path_for(&config_path);
+        let session = Session::load(&session_path);
+        let effective_settings = settings.effective(&session);
+        set_drive_aliases(&settings.drive_names);
         let config_write_blocked = settings_error.is_some() && config_path.exists();
         let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
         // Restore the interface zoom the user last chose with Ctrl + / Ctrl -, so the window
@@ -761,7 +778,7 @@ impl AppCore {
         explorer.options.title_bar = frameless;
         let mut state = ExplorerState::new();
         state.subfolders_fn = Some(subfolders);
-        load_settings_into_state(&mut state, &settings);
+        load_settings_into_state(&mut state, &effective_settings);
         if let Some(arg) =
             std::env::args().find_map(|a| a.strip_prefix("--ribbon=").map(str::to_owned))
         {
@@ -817,7 +834,7 @@ impl AppCore {
         seed_tiers();
         let entries = load_dir(&start, true);
         state.set_location(start, entries);
-        if let Some(fv) = settings.folder_view(&state.location).cloned() {
+        if let Some(fv) = effective_settings.folder_view(&state.location).cloned() {
             apply_folder_view(&mut state, &fv);
         }
         let folder_view_active = Some((state.location.clone(), folder_view_from_state(&state)));
@@ -895,6 +912,11 @@ impl AppCore {
             settings,
             config_path,
             config_write_blocked,
+            session,
+            session_path,
+            config_mtime,
+            config_reload_checked: Instant::now(),
+            drive_keys: HashMap::new(),
             thumbnail_store,
             thumbnail_jobs: job_tx,
             worker_messages: worker_rx,
@@ -949,8 +971,18 @@ impl AppCore {
         app
     }
 
-    /// When `ribbon.remember` / `view.remember` are on, keep the settings in step with what
+    /// The view remembered for `folder`: `session.toml` first, then a `[per_folder]` table an
+    /// older version (or you) left in `settings.toml`.
+    fn saved_folder_view(&self, folder: &Path) -> Option<FolderView> {
+        self.session
+            .folder_view(folder)
+            .or_else(|| self.settings.folder_view(folder))
+            .cloned()
+    }
+
+    /// When `ribbon.remember` / `view.remember` are on, keep `session.toml` in step with what
     /// the user chose in the app. `save` is change-aware, so this writes only on a change.
+    /// `settings.toml` is never touched here.
     fn sync_remembered_prefs(&mut self) {
         let mut changed = false;
         if self.settings.ribbon.remember {
@@ -959,8 +991,9 @@ impl AppCore {
                 RibbonMode::Minimized => SavedRibbonMode::Minimized,
                 RibbonMode::Hidden => SavedRibbonMode::Hidden,
             };
-            if mode != self.settings.ribbon.mode {
-                self.settings.ribbon.mode = mode;
+            let current = self.session.ribbon_mode.unwrap_or(self.settings.ribbon.mode);
+            if mode != current {
+                self.session.ribbon_mode = Some(mode);
                 changed = true;
             }
         }
@@ -975,8 +1008,9 @@ impl AppCore {
                 egui_explorer::ViewMode::Tiles => SavedViewMode::Tiles,
                 egui_explorer::ViewMode::Content => SavedViewMode::Content,
             };
-            if mode != self.settings.view.mode {
-                self.settings.view.mode = mode;
+            let current = self.session.view_mode.unwrap_or(self.settings.view.mode);
+            if mode != current {
+                self.session.view_mode = Some(mode);
                 changed = true;
             }
         }
@@ -986,14 +1020,20 @@ impl AppCore {
             if loc == self.state.location {
                 let current = folder_view_from_state(&self.state);
                 if current != baseline {
-                    self.settings.set_folder_view(&loc, current.clone());
+                    self.session.set_folder_view(&loc, current.clone());
                     self.folder_view_active = Some((loc, current));
                     changed = true;
                 }
             }
         }
         if changed {
-            self.save_settings();
+            self.save_session();
+        }
+    }
+
+    fn save_session(&mut self) {
+        if let Err(error) = self.session.save(&self.session_path) {
+            self.status = format!("Could not save session state: {error}");
         }
     }
 
@@ -1005,6 +1045,9 @@ impl AppCore {
         if let Err(error) = self.settings.save(&self.config_path) {
             self.status = format!("Could not save settings: {error}");
         }
+        self.config_mtime = fs::metadata(&self.config_path)
+            .and_then(|m| m.modified())
+            .ok();
     }
 
     fn attach_current_thumbnails(&mut self) {
@@ -1128,7 +1171,7 @@ impl AppCore {
                 }
             }
             self.state.set_location(path.clone(), entries);
-            if let Some(fv) = self.settings.folder_view(&path).cloned() {
+            if let Some(fv) = self.saved_folder_view(&path) {
                 apply_folder_view(&mut self.state, &fv);
             }
             self.folder_view_active = Some((path.clone(), folder_view_from_state(&self.state)));
@@ -1284,6 +1327,12 @@ impl AppCore {
     fn apply_drives(&mut self, list: Vec<Drive>, entries: Vec<Entry>) {
         self.drive_scan_busy.store(false, Ordering::Release);
         self.drive_devices.clear();
+        self.drive_keys.clear();
+        for d in &list {
+            if let Some(key) = &d.key {
+                self.drive_keys.insert(d.path.clone(), key.clone());
+            }
+        }
         self.drive_unmountable = list
             .iter()
             .filter(|d| !d.mounted && !d.mountable)
@@ -2002,7 +2051,9 @@ impl AppCore {
             self.state.cut.clear();
             self.state.clipboard_has_items = self.clipboard.is_some();
         }
-        let permanent_replace = self.settings.permanent_delete_on_replace;
+        // Replacing removes the original; `delete_moveto_trash = false` makes that permanent too.
+        let permanent_replace =
+            self.settings.permanent_delete_on_replace || !self.settings.delete_moveto_trash;
         self.spawn_job(move || transfer_job(origin, paths, dest, cut, choice, permanent_replace));
     }
 
@@ -2464,7 +2515,12 @@ impl AppCore {
                         // listing was being read. The completion is also ignored after closure.
                         if child.state.location == path {
                             child.state.set_entries(entries);
-                            if let Some(view) = self.settings.folder_view(&path).cloned() {
+                            if let Some(view) = self
+                                .session
+                                .folder_view(&path)
+                                .or_else(|| self.settings.folder_view(&path))
+                                .cloned()
+                            {
                                 apply_folder_view(&mut child.state, &view);
                             }
                         }
@@ -2735,6 +2791,10 @@ impl AppCore {
             Event::Search(query) => self.search(query),
             Event::ThumbnailNeeded(path) => self.request_thumbnail(path),
             Event::Rename { path, new_name } => {
+                if let Some(key) = self.drive_keys.get(&path).cloned() {
+                    self.rename_drive(ctx, &path, key, &new_name);
+                    return;
+                }
                 let to = path.with_file_name(&new_name);
                 if to == path {
                     return;
@@ -2916,6 +2976,120 @@ impl AppCore {
                 ..JobOutcome::default()
             }
         });
+    }
+
+    /// Rename a drive. The new name always applies inside the file manager (stored under
+    /// `[drive-names]` in settings.toml, so it is the same mounted or not). With
+    /// `drive-rename-on-disk = true` the filesystem label is changed too, through udisks'
+    /// `SetLabel` (polkit allows it without a password for the active local session; NTFS
+    /// needs `ntfs-3g` and an unmounted drive). An empty name restores the drive's own label.
+    fn rename_drive(&mut self, ctx: &egui::Context, path: &Path, key: String, new_name: &str) {
+        let name = new_name.trim();
+        if name.is_empty() {
+            self.settings.drive_names.remove(&key);
+        } else if name.chars().any(char::is_control) || name.contains('/') {
+            self.status = "Rename failed: a drive name cannot contain '/' or control characters.".into();
+            return;
+        } else {
+            self.settings.drive_names.insert(key, name.to_owned());
+        }
+        set_drive_aliases(&self.settings.drive_names);
+        self.save_settings();
+        self.status = if name.is_empty() {
+            "Drive name reset.".into()
+        } else {
+            format!("Drive renamed to '{name}'.")
+        };
+        if self.settings.drive_rename_on_disk
+            && !name.is_empty()
+            && let Some(device) = self.drive_devices.get(path).cloned()
+        {
+            self.write_drive_label(ctx, device, name.to_owned());
+        } else {
+            self.refresh_drives(ctx);
+        }
+    }
+
+    /// Write `label` to the filesystem on `device` via udisks over D-Bus (`busctl`), off the UI
+    /// thread. Unlike `udisksctl` (which cannot set labels) this needs no password for the
+    /// active session, and udisks picks the right tool (`ntfslabel`, `e2label`, ...).
+    fn write_drive_label(&mut self, ctx: &egui::Context, device: String, label: String) {
+        let node = Path::new(&device)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let object = format!("/org/freedesktop/UDisks2/block_devices/{node}");
+        let tx = self.worker_messages_sender();
+        let worker_ctx = ctx.clone();
+        let spawned = thread::Builder::new()
+            .name("file-manager-drive-label".into())
+            .spawn(move || {
+                let out = Proc::new("busctl")
+                    .args(["--system", "call", "org.freedesktop.UDisks2", &object])
+                    .args(["org.freedesktop.UDisks2.Filesystem", "SetLabel", "sa{sv}"])
+                    .arg(&label)
+                    .arg("0")
+                    .output();
+                let (ok, message) = match out {
+                    Ok(out) if out.status.success() => (
+                        true,
+                        format!("Drive renamed to '{label}' (also written to {device})."),
+                    ),
+                    Ok(out) => {
+                        let err = String::from_utf8_lossy(&out.stderr);
+                        let err = err.trim();
+                        let hint = if err.contains("not mounted") || err.contains("busy") {
+                            " Unmount the drive first (required for NTFS)."
+                        } else {
+                            ""
+                        };
+                        (
+                            false,
+                            format!(
+                                "Could not write the label to {device}: {err}.{hint} The name is still changed in the file manager."
+                            ),
+                        )
+                    }
+                    Err(error) => (
+                        false,
+                        format!("Could not run busctl: {error}. The name is still changed in the file manager."),
+                    ),
+                };
+                let _ = tx.send(WorkerMessage::DriveOp { ok, message });
+                worker_ctx.request_repaint();
+            });
+        if spawned.is_err() {
+            self.refresh_drives(ctx);
+        }
+    }
+
+    /// Import `settings.toml` again when it was edited while the app runs, so manual edits
+    /// take effect without a restart. Only a file that parses is taken; a half-typed edit
+    /// is ignored until it is valid. Our own saves update `config_mtime` and never loop.
+    fn reload_settings_if_edited(&mut self, ctx: &egui::Context) {
+        if self.config_reload_checked.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        self.config_reload_checked = Instant::now();
+        let Ok(modified) = fs::metadata(&self.config_path).and_then(|m| m.modified()) else {
+            return;
+        };
+        if self.config_mtime == Some(modified) {
+            return;
+        }
+        self.config_mtime = Some(modified);
+        let Ok(fresh) = Settings::load(&self.config_path) else {
+            return;
+        };
+        if fresh == self.settings {
+            return;
+        }
+        self.settings = fresh;
+        self.config_write_blocked = false;
+        set_drive_aliases(&self.settings.drive_names);
+        load_settings_into_state(&mut self.state, &self.settings.effective(&self.session));
+        self.refresh_drives(ctx);
+        self.status = "Reloaded settings.toml.".into();
     }
 
     /// Mount or unmount `device` via `udisksctl`, off the UI thread: `udisksctl` blocks
@@ -3329,6 +3503,14 @@ impl AppCore {
                     }
                 }
             }
+            Command::Delete if !self.settings.delete_moveto_trash && !self.state.in_trash() => {
+                // `delete_moveto_trash = false`: a normal delete is permanent, so ask first
+                // (the same prompt as "Delete permanently"). Nothing goes to the Trash and
+                // there is nothing to undo.
+                if !targets.is_empty() {
+                    self.pending_delete = Some(targets.clone());
+                }
+            }
             Command::Delete => {
                 for path in &targets {
                     if let Err(error) = move_to_trash(path) {
@@ -3578,7 +3760,7 @@ impl AppCore {
         explorer.options.title_bar = self.explorer.options.title_bar;
         let mut state = ExplorerState::new();
         state.subfolders_fn = Some(subfolders);
-        load_settings_into_state(&mut state, &self.settings);
+        load_settings_into_state(&mut state, &self.settings.effective(&self.session));
         let pins: Vec<PathBuf> = self.behavior.pins().cloned().collect();
         state.nav = build_nav(&pins, self.settings.nav.this_pc_expanded);
         // Do not scan the requested folder on the UI thread. This process may already be
@@ -3675,7 +3857,7 @@ impl AppCore {
                             break;
                         }
                         let listed = Proc::new("timeout")
-                            .args(["-k", "100ms", "500ms", "hyprctl", "-j", "clients"])
+                            .args(["-k", "0.1", "0.5", "hyprctl", "-j", "clients"])
                             .output()
                             .is_ok_and(|output| {
                                 output.status.success()
@@ -4006,7 +4188,7 @@ fn hyprland_dispatch(dispatcher: &str, argument: &str) -> bool {
         return false;
     }
     Proc::new("timeout")
-        .args(["-k", "100ms", "500ms", "hyprctl", "dispatch", dispatcher, argument])
+        .args(["-k", "0.1", "0.5", "hyprctl", "dispatch", dispatcher, argument])
         .output()
         .is_ok_and(|output| {
             output.status.success()
@@ -4042,6 +4224,7 @@ impl AppCore {
         }
         self.window_frame(ui, &ctx);
         self.sync_remembered_prefs();
+        self.reload_settings_if_edited(&ctx);
         self.child_windows(shared, &ctx);
         self.tick_persistence(&ctx);
         self.tick_drive_poll(&ctx);
@@ -4394,8 +4577,46 @@ fn quick_access_nodes(user_pins: &[PathBuf]) -> Vec<NavNode> {
     quick
 }
 
+/// Custom drive names (`[drive-names]` in settings.toml), keyed like [`drive_key`]. Consulted by
+/// every drive scan so a renamed drive keeps its name whether it is mounted or not.
+static DRIVE_ALIASES: LazyLock<RwLock<HashMap<String, String>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+fn set_drive_aliases(names: &std::collections::BTreeMap<String, String>) {
+    let mut map = DRIVE_ALIASES
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.clear();
+    map.extend(
+        names
+            .iter()
+            .filter(|(_, name)| !name.trim().is_empty())
+            .map(|(key, name)| (key.clone(), name.trim().to_owned())),
+    );
+}
+
+fn drive_alias(key: &str) -> Option<String> {
+    DRIVE_ALIASES
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(key)
+        .cloned()
+}
+
+/// What a drive's custom name is stored under: its filesystem UUID (stable across ports and
+/// reboots), else the device node.
+fn drive_key(uuid: &str, device: &str) -> String {
+    if uuid.is_empty() {
+        device.to_owned()
+    } else {
+        uuid.to_owned()
+    }
+}
+
 /// One block-device partition (or whole-disk filesystem) as reported by `lsblk`.
 struct BlockDevice {
+    /// Key the drive's custom name is stored under (see [`drive_key`]).
+    key: String,
     /// `/dev/sdXN` or similar.
     path: String,
     /// What the drive is called: its filesystem label, else `sdb3 (393.9G)`.
@@ -4561,7 +4782,7 @@ fn probe_fstype(device: &str, spawn: bool) -> String {
         return String::new();
     }
     let fstype = Proc::new("timeout")
-        .args(["-k", "500ms", "3s", "udisksctl", "info", "-b", device])
+        .args(["-k", "0.5", "3s", "udisksctl", "info", "-b", device])
         .output()
         .ok()
         .filter(|out| out.status.success())
@@ -4588,19 +4809,23 @@ fn list_block_devices(mounts: &[MountEntry], probe: bool) -> Vec<BlockDevice> {
     let Ok(out) = Proc::new("timeout")
         .args([
             "-k",
-            "500ms",
+            "0.5",
             "5s",
             "lsblk",
             "-P",
             "-p",
             "-o",
-            "PATH,FSTYPE,MOUNTPOINT,TYPE,LABEL,SIZE,PKNAME,PARTTYPE",
+            "PATH,FSTYPE,MOUNTPOINT,TYPE,LABEL,SIZE,PKNAME,PARTTYPE,UUID",
         ])
         .output()
     else {
         return Vec::new();
     };
-    let text = String::from_utf8_lossy(&out.stdout);
+    block_devices_from_lsblk(&String::from_utf8_lossy(&out.stdout), mounts, probe)
+}
+
+/// The parsing half of [`list_block_devices`], separated so it can be tested on captured output.
+fn block_devices_from_lsblk(text: &str, mounts: &[MountEntry], probe: bool) -> Vec<BlockDevice> {
     let rows: Vec<std::collections::HashMap<String, String>> =
         text.lines().map(parse_lsblk_pairs).collect();
     // A disk (or extended partition) that has partitions below it is a container, not a drive.
@@ -4651,9 +4876,14 @@ fn list_block_devices(mounts: &[MountEntry], probe: bool) -> Vec<BlockDevice> {
         if is_hidden_fstype(&fstype) {
             continue;
         }
-        let label = match f.get("LABEL").filter(|l| !l.is_empty()) {
-            Some(label) => unescape_lsblk(label),
-            None => {
+        let key = drive_key(f.get("UUID").map(String::as_str).unwrap_or(""), &path);
+        let label = drive_alias(&key)
+            .or_else(|| {
+                f.get("LABEL")
+                    .filter(|l| !l.is_empty())
+                    .map(|label| unescape_lsblk(label))
+            })
+            .unwrap_or_else(|| {
                 let node = Path::new(&path)
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
@@ -4663,9 +4893,9 @@ fn list_block_devices(mounts: &[MountEntry], probe: bool) -> Vec<BlockDevice> {
                 } else {
                     format!("{node} ({size})")
                 }
-            }
-        };
+            });
         devices.push(BlockDevice {
+            key,
             mountable: mountpoint.is_some() || !is_unmountable_fstype(&fstype),
             path,
             label,
@@ -4684,6 +4914,8 @@ struct Drive {
     /// `/dev/sdXN`; `None` only for the root filesystem, which is never offered for
     /// mount/unmount.
     device: Option<String>,
+    /// Key its custom name is stored under (`None` for the root filesystem).
+    key: Option<String>,
     mounted: bool,
     /// Whether a Mount can be attempted (always `true` once mounted).
     mountable: bool,
@@ -4708,6 +4940,7 @@ fn drives_with(probe: bool) -> Vec<Drive> {
         path: PathBuf::from("/"),
         name: "File System".to_owned(),
         device: None,
+        key: None,
         mounted: true,
         mountable: true,
     }];
@@ -4736,6 +4969,7 @@ fn drives_with(probe: bool) -> Vec<Drive> {
             path: m.point.clone(),
             name,
             device: m.source.starts_with("/dev/").then(|| m.source.clone()),
+            key: m.source.starts_with("/dev/").then(|| m.source.clone()),
             mounted: true,
             mountable: true,
         });
@@ -4743,11 +4977,14 @@ fn drives_with(probe: bool) -> Vec<Drive> {
     for bd in list_block_devices(&mounts, probe) {
         match bd.mountpoint {
             Some(mp) if seen.contains(&mp) => {
-                // Already listed from the mount table: just remember which device it is.
-                if let Some(d) = drives.iter_mut().find(|d| d.path == mp && d.device.is_none())
-                    && mp != Path::new("/")
+                // Already listed from the mount table (named after its mount-point folder):
+                // learn which device it is and give it the same name it had while unmounted.
+                if mp != Path::new("/")
+                    && let Some(d) = drives.iter_mut().find(|d| d.path == mp)
                 {
                     d.device = Some(bd.path);
+                    d.key = Some(bd.key);
+                    d.name = bd.label;
                 }
             }
             Some(mp) => {
@@ -4756,6 +4993,7 @@ fn drives_with(probe: bool) -> Vec<Drive> {
                     path: mp,
                     name: bd.label,
                     device: Some(bd.path),
+                    key: Some(bd.key),
                     mounted: true,
                     mountable: true,
                 });
@@ -4764,6 +5002,7 @@ fn drives_with(probe: bool) -> Vec<Drive> {
                 path: PathBuf::from(format!("{UNMOUNTED_DRIVE_PREFIX}{}", bd.path)),
                 name: bd.label,
                 device: Some(bd.path),
+                key: Some(bd.key),
                 mounted: false,
                 mountable: bd.mountable,
             }),
@@ -4777,7 +5016,7 @@ fn drive_space(path: &Path) -> Option<(u64, u64)> {
     // `timeout`: `df` blocks indefinitely on a stale network mount, which would wedge the
     // drive-scan worker (and with it every later refresh).
     let out = Proc::new("timeout")
-        .args(["-k", "500ms", "3s", "df", "-B1", "--output=size,avail"])
+        .args(["-k", "0.5", "3s", "df", "-B1", "--output=size,avail"])
         .arg(path)
         .output()
         .ok()?;
@@ -6579,6 +6818,7 @@ mod tests {
             path: PathBuf::from(format!("{UNMOUNTED_DRIVE_PREFIX}/dev/sdb1")),
             name: "USB".into(),
             device: Some("/dev/sdb1".into()),
+            key: Some("1234-ABCD".into()),
             mounted: false,
             mountable: true,
         }]);
@@ -6594,6 +6834,59 @@ mod tests {
                 .to_str()
                 .is_some_and(|s| s.starts_with(UNMOUNTED_DRIVE_PREFIX))
         );
+    }
+
+    /// GNU `timeout` rejects `ms` suffixes ("invalid time interval", exit 125) and then runs
+    /// nothing, which silently emptied the drive list. Intervals must be plain seconds.
+    #[test]
+    fn timeout_wrapper_arguments_are_accepted_by_gnu_timeout() {
+        let status = Proc::new("timeout")
+            .args(["-k", "0.5", "3", "true"])
+            .status()
+            .expect("run timeout");
+        assert!(status.success());
+    }
+
+    #[test]
+    fn unmounted_ntfs_partitions_are_listed_beside_the_mounted_root() {
+        let text = r#"PATH="/dev/sda" FSTYPE="" MOUNTPOINT="" TYPE="disk" LABEL="" SIZE="931.5G" PKNAME="" PARTTYPE="" UUID=""
+PATH="/dev/sda1" FSTYPE="vfat" MOUNTPOINT="" TYPE="part" LABEL="" SIZE="260M" PKNAME="/dev/sda" PARTTYPE="c12a7328-f81f-11d2-ba4b-00a0c93ec93b" UUID="AAAA-BBBB"
+PATH="/dev/sda3" FSTYPE="ntfs" MOUNTPOINT="" TYPE="part" LABEL="Games" SIZE="393.9G" PKNAME="/dev/sda" PARTTYPE="ebd0a0a2-b9e5-4433-87c0-68b6b72699c7" UUID="1234567890ABCDEF"
+PATH="/dev/nvme0n1" FSTYPE="" MOUNTPOINT="" TYPE="disk" LABEL="" SIZE="476.9G" PKNAME="" PARTTYPE="" UUID=""
+PATH="/dev/nvme0n1p2" FSTYPE="ext4" MOUNTPOINT="/" TYPE="part" LABEL="" SIZE="476.4G" PKNAME="/dev/nvme0n1" PARTTYPE="0fc63daf" UUID="u-root"
+"#;
+        let devs = block_devices_from_lsblk(text, &[], false);
+        let games = devs.iter().find(|d| d.path == "/dev/sda3").expect("sda3 listed");
+        assert_eq!((games.label.as_str(), games.mountpoint.is_none(), games.mountable), ("Games", true, true));
+        assert!(devs.iter().any(|d| d.path == "/dev/sda1"));
+        assert!(devs.iter().all(|d| d.path != "/dev/sda" && d.path != "/dev/nvme0n1"));
+    }
+
+    #[test]
+    fn drive_names_are_keyed_by_uuid_with_device_fallback() {
+        assert_eq!(drive_key("1234-ABCD", "/dev/sdb1"), "1234-ABCD");
+        assert_eq!(drive_key("", "/dev/sdb1"), "/dev/sdb1");
+        let mut names = std::collections::BTreeMap::new();
+        names.insert("test-uuid-for-alias".to_owned(), "  Backup disk ".to_owned());
+        names.insert("blank-name".to_owned(), "   ".to_owned());
+        set_drive_aliases(&names);
+        assert_eq!(drive_alias("test-uuid-for-alias").as_deref(), Some("Backup disk"));
+        assert_eq!(drive_alias("blank-name"), None);
+        set_drive_aliases(&Default::default());
+        assert_eq!(drive_alias("test-uuid-for-alias"), None);
+    }
+
+    #[test]
+    fn permanent_delete_removes_files_and_folders_without_trash() {
+        let temp = TestDir::new();
+        let file = temp.0.join("a.txt");
+        let dir = temp.0.join("d");
+        fs::write(&file, b"x").unwrap();
+        fs::create_dir_all(dir.join("inner")).unwrap();
+        fs::write(dir.join("inner/b.txt"), b"y").unwrap();
+        let outcome = delete_job(temp.0.clone(), vec![file.clone(), dir.clone()], false);
+        assert_eq!(outcome.status.as_deref(), Some(""));
+        assert!(!file.exists() && !dir.exists());
     }
 
     #[test]
