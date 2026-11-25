@@ -4,6 +4,7 @@
 //! cost-selected thumbnails are ever written, and only rarely.
 
 mod open_with;
+mod paste_text;
 mod single_instance;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -19,7 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use egui::{ColorImage, TextureHandle, TextureOptions};
 use egui_explorer::{
     Command, CompressFormat, Entry, EntryKind, Event, Explorer, ExplorerState, Icon, NavNode,
-    PermMode, QUICK_ACCESS_LOCATION, RibbonMode, THIS_PC_LOCATION, dialogs,
+    NewFileKind, PermMode, QUICK_ACCESS_LOCATION, RibbonMode, THIS_PC_LOCATION, dialogs,
 };
 use fm_behav::Behavior;
 use fm_persist::{AtomicFile, FlushPolicy, Flusher, Outcome, WriteCounter};
@@ -2128,6 +2129,55 @@ impl AppCore {
         self.clipboard.clone()
     }
 
+    /// Plain text on the system clipboard that is *not* a file list or a list of existing
+    /// paths (those paste as files). `None` when the clipboard holds files, an image or nothing.
+    fn clipboard_plain_text(&mut self) -> Option<String> {
+        if self.sys_clipboard.is_none() {
+            self.sys_clipboard = arboard::Clipboard::new().ok();
+        }
+        let clipboard = self.sys_clipboard.as_mut()?;
+        if clipboard
+            .get()
+            .file_list()
+            .is_ok_and(|paths| !paths.is_empty())
+        {
+            return None;
+        }
+        let text = clipboard.get_text().ok()?;
+        if text.trim().is_empty() || !paths_from_clipboard_text(&text).is_empty() {
+            return None;
+        }
+        Some(text)
+    }
+
+    /// Ctrl+V with text on the clipboard: save it as a new file here. Python and shell scripts
+    /// are recognised by their structure and get `.py` / `.sh`; any other text becomes `.txt`.
+    fn paste_text_as_file(&mut self, here: &Path, text: &str) {
+        if !here.is_dir() {
+            self.status = "Open a folder to paste text as a file.".into();
+            return;
+        }
+        let Some(kind) = paste_text::detect(text) else {
+            self.status = "Nothing to paste.".into();
+            return;
+        };
+        let path = unique(&here.join(kind.default_name()));
+        // Only a script that already starts with a shebang is made executable.
+        let executable = kind.is_script() && text.starts_with("#!");
+        match create_new_file(&path, text, executable) {
+            Ok(()) => {
+                self.record_undo(UndoAction::Trash(path.clone()));
+                self.status = format!(
+                    "Pasted text as {}.",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                );
+                self.reload();
+                self.begin_rename(path);
+            }
+            Err(error) => self.status = format!("Could not paste text as a file: {error}"),
+        }
+    }
+
     /// Put plain text on the system clipboard (copy path / name / URL). The persistent arboard
     /// handle is used first, because it is the same one that already works for file copies and
     /// it keeps serving the selection afterwards (X11 / Wayland data-control). `ctx.copy_text`
@@ -2350,6 +2400,16 @@ impl AppCore {
             if !is_dir {
                 e.size = meta.len();
                 e.type_name = fm_mime::guess(&path).type_name;
+            }
+            // Same icon rules as a normal folder listing: Downloads / Documents / ... keep
+            // their custom icon here, executables keep theirs, links get target icon + badge.
+            if is_dir {
+                e.icon = special_folder_icon(&path);
+            } else if is_executable_without_extension(&path) {
+                e.icon = Some(Icon::FileExec);
+            }
+            if fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+                mark_symlink(&mut e, &path, is_dir);
             }
             entries.push(e);
         }
@@ -2783,7 +2843,8 @@ impl AppCore {
                             .file_name()
                             .map(|name| name.to_string_lossy().into_owned())
                             .unwrap_or_default();
-                        NavNode::new(child, name, Icon::Folder)
+                        let icon = special_folder_icon(&child).unwrap_or(Icon::Folder);
+                        NavNode::new(child, name, icon)
                     })
                     .collect();
                 self.state.set_nav_children(&path, kids);
@@ -3216,7 +3277,9 @@ impl AppCore {
                 self.clipboard = Some((targets, true));
             }
             Command::Paste => {
-                if let Some((paths, cut)) = self.clipboard_paths() {
+                if let Some(text) = self.clipboard_plain_text() {
+                    self.paste_text_as_file(&here, &text);
+                } else if let Some((paths, cut)) = self.clipboard_paths() {
                     self.start_transfer(paths, here.to_path_buf(), cut, true);
                 } else {
                     self.status = "Nothing to paste.".into();
@@ -3292,6 +3355,17 @@ impl AppCore {
                     .open(&new_path)
                 {
                     Ok(_file) => {
+                        self.record_undo(UndoAction::Trash(new_path.clone()));
+                        self.reload();
+                        self.begin_rename(new_path);
+                    }
+                    Err(error) => self.status = format!("Create file failed: {error}"),
+                }
+            }
+            Command::NewFile(kind) => {
+                let new_path = unique(&here.join(kind.default_name()));
+                match create_new_file(&new_path, kind.template(), kind.executable()) {
+                    Ok(()) => {
                         self.record_undo(UndoAction::Trash(new_path.clone()));
                         self.reload();
                         self.begin_rename(new_path);
@@ -4452,6 +4526,7 @@ fn entry_from_item(item: fm_tiers::Item) -> Entry {
     if !is_dir && matches!(item.kind, fm_tiers::Kind::Symlink) {
         is_dir = fs::metadata(&p).is_ok_and(|target| target.is_dir());
     }
+    let is_link = matches!(item.kind, fm_tiers::Kind::Symlink);
     let mut e = Entry::new(
         &p,
         if is_dir {
@@ -4474,7 +4549,34 @@ fn entry_from_item(item: fm_tiers::Item) -> Entry {
         // so a user's `extension.<ext>` icons for named types still win.
         e.icon = Some(Icon::FileExec);
     }
+    if is_link {
+        mark_symlink(&mut e, &p, is_dir);
+    }
     e
+}
+
+/// Make a symbolic link look like what it points to (custom folder icons, per-extension icons,
+/// executable icon), and flag it so the list draws the link badge on top.
+fn mark_symlink(e: &mut Entry, link: &Path, is_dir: bool) {
+    e.is_link = true;
+    let Ok(target) = fs::canonicalize(link) else {
+        return; // dangling link: the badge on the default icon says it all
+    };
+    if is_dir {
+        if let Some(icon) = special_folder_icon_resolved(&target) {
+            e.icon = Some(icon);
+        }
+        return;
+    }
+    // Icons are chosen from the target's name, not from the link's own name.
+    e.icon = None;
+    if let Some(name) = target.file_name() {
+        e.icon_name_lc = Some(name.to_string_lossy().to_lowercase());
+    }
+    if is_executable_without_extension(&target) {
+        e.icon = Some(Icon::FileExec);
+    }
+    e.type_name = fm_mime::guess(&target).type_name;
 }
 
 /// An extensionless regular file with an execute bit (one stat, only for such names).
@@ -4542,6 +4644,28 @@ fn special_folder_icon(p: &Path) -> Option<Icon> {
         .map(|(_, i)| i)
 }
 
+/// Like [`special_folder_icon`] for an already canonical path: the well-known folders are
+/// canonicalised too, so a link to `~/Downloads` matches even when `~` itself is a symlink.
+fn special_folder_icon_resolved(canonical: &Path) -> Option<Icon> {
+    if let Some(icon) = special_folder_icon(canonical) {
+        return Some(icon);
+    }
+    let home = dirs::home_dir();
+    let table = [
+        (dirs::desktop_dir(), Icon::FolderDesktop),
+        (dirs::download_dir(), Icon::FolderDownloads),
+        (dirs::document_dir(), Icon::FolderDocuments),
+        (dirs::picture_dir(), Icon::FolderPictures),
+        (dirs::audio_dir(), Icon::FolderMusic),
+        (dirs::video_dir(), Icon::FolderVideos),
+        (home, Icon::FolderHome),
+    ];
+    table.into_iter().find_map(|(dir, icon)| {
+        let dir = fs::canonicalize(dir?).ok()?;
+        (dir == canonical).then_some(icon)
+    })
+}
+
 fn subfolders(p: &Path) -> Vec<PathBuf> {
     tiers().subdirs(p).unwrap_or_default()
 }
@@ -4572,7 +4696,8 @@ fn quick_access_nodes(user_pins: &[PathBuf]) -> Vec<NavNode> {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| pin.display().to_string());
-        quick.push(NavNode::new(pin.clone(), name, Icon::Folder).pinned());
+        let icon = special_folder_icon(pin).unwrap_or(Icon::Folder);
+        quick.push(NavNode::new(pin.clone(), name, icon).pinned());
     }
     quick
 }
@@ -6475,6 +6600,23 @@ fn canonicalize_existing_prefix(p: &Path) -> PathBuf {
             _ => return p.to_path_buf(),
         }
     }
+}
+
+/// Create `path` exclusively (never overwrites), write `contents`, and give it the execute bit
+/// when `executable` (rwxr-xr-x, subject to umask).
+fn create_new_file(path: &Path, contents: &str, executable: bool) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if executable {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o755);
+    }
+    #[cfg(not(unix))]
+    let _ = executable;
+    let mut file = options.open(path)?;
+    file.write_all(contents.as_bytes())
 }
 
 #[cfg(unix)]

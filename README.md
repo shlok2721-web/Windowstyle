@@ -106,6 +106,9 @@ Eight layouts are available: **Extra large icons, Large icons, Medium icons, Sma
 - Copy, Cut, Paste, Move to, Copy to, Rename and Delete
 - New folder and New text file
 - Paste shortcut and New shortcut (symbolic links)
+- New menu: folder, shortcut, text document, and an executable script without extension (`Program`), `.py`, `.sh`, `.md` and `.svg` files
+- Ctrl+V with text on the clipboard creates a file in the current folder: `.py` or `.sh` when the text is clearly a Python or shell script, `.txt` otherwise
+- Symbolic links show their target's icon (custom folder and per-extension icons included) with a small link badge; drop a `LinkOverlay.svg` into the icon folder to replace the built-in badge
 - **Name conflict handling.** Choose to replace or keep both.
 - **Undo and Redo** for file operations
 - **Drag and drop** onto folders and navigation pane entries

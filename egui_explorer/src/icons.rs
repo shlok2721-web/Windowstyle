@@ -141,6 +141,8 @@ pub enum Icon {
     DeleteHistory,
     Undo,
     Redo,
+    /// Badge drawn over a symbolic link's icon (replace with `LinkOverlay.svg` in the icon folder).
+    LinkOverlay,
 }
 
 impl Icon {
@@ -250,6 +252,7 @@ impl Icon {
         Icon::DeleteHistory,
         Icon::Undo,
         Icon::Redo,
+        Icon::LinkOverlay,
     ];
 
     /// Stable, case-sensitive filename stem used in the user's icon directory.
@@ -359,6 +362,7 @@ impl Icon {
             Icon::DeleteHistory => "DeleteHistory",
             Icon::Undo => "Undo",
             Icon::Redo => "Redo",
+            Icon::LinkOverlay => "LinkOverlay",
         }
     }
 }
@@ -1531,6 +1535,13 @@ fn draw(icon: Icon, c: &Cv) {
                 1.5,
             );
             c.poly(&[(14.2, 6.0), (9.5, 2.5), (9.5, 9.5)], BLUE);
+        }
+        // Shortcut-style badge in the bottom-left corner: white tile, blue up-right arrow.
+        LinkOverlay => {
+            c.rfill(0.2, 8.2, 7.8, 7.8, 1.3, WHITE);
+            c.rframe(0.2, 8.2, 7.8, 7.8, 1.3, GRAY, 0.6);
+            c.line(&[(2.3, 13.7), (5.6, 10.4)], BLUE, 1.3);
+            c.poly(&[(3.6, 10.0), (6.4, 10.0), (6.4, 12.8)], BLUE);
         }
     }
 }

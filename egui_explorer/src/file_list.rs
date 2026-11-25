@@ -580,8 +580,39 @@ fn show_history(ui: &mut Ui, state: &mut ExplorerState) {
 
     state.view = files_view;
     state.scope = ListScope::FilesOnly;
+    fit_history_columns(state, avail.x);
     show_pane(ui, state);
     state.scope = ListScope::All;
+}
+
+/// Quick access: stretch the Details columns over the whole pane width. Name takes 40 % and
+/// every other visible column 15 % (these add up to 100 % with all five columns shown; with
+/// fewer visible columns the shares are scaled up so the row still spans the window). Room is
+/// left for the vertical scrollbar so no horizontal scrollbar appears.
+fn fit_history_columns(state: &mut ExplorerState, avail_x: f32) {
+    const NAME_SHARE: f32 = 40.0;
+    const OTHER_SHARE: f32 = 15.0;
+    // `details_width` adds 4 px of margin and the vertical scrollbar takes about 14 px.
+    let total = (avail_x - 18.0).max(320.0);
+    let weight = |c: &Column| {
+        if !c.visible {
+            0.0
+        } else if c.key == SortKey::Name {
+            NAME_SHARE
+        } else {
+            OTHER_SHARE
+        }
+    };
+    let sum: f32 = state.columns.iter().map(weight).sum();
+    if sum <= 0.0 {
+        return;
+    }
+    for c in state.columns.iter_mut() {
+        let w = weight(&*c);
+        if w > 0.0 {
+            c.width = (total * w / sum).floor().max(40.0);
+        }
+    }
 }
 
 fn show_pane(ui: &mut Ui, state: &mut ExplorerState) {
@@ -1361,6 +1392,17 @@ fn background_menu_full() -> Vec<MenuEntry> {
                 M::item("Folder", C::NewFolder).icon(Icon::Folder),
                 M::item("Shortcut", C::NewShortcut),
                 M::item("Text Document", C::NewTextFile).icon(Icon::FileText),
+                M::Sep,
+                M::item(NewFileKind::Executable.label(), C::NewFile(NewFileKind::Executable))
+                    .icon(NewFileKind::Executable.icon()),
+                M::item(NewFileKind::Python.label(), C::NewFile(NewFileKind::Python))
+                    .icon(NewFileKind::Python.icon()),
+                M::item(NewFileKind::Shell.label(), C::NewFile(NewFileKind::Shell))
+                    .icon(NewFileKind::Shell.icon()),
+                M::item(NewFileKind::Markdown.label(), C::NewFile(NewFileKind::Markdown))
+                    .icon(NewFileKind::Markdown.icon()),
+                M::item(NewFileKind::Svg.label(), C::NewFile(NewFileKind::Svg))
+                    .icon(NewFileKind::Svg.icon()),
             ],
         },
         M::Sep,
@@ -1871,6 +1913,7 @@ pub(crate) fn paint_icon_or_thumb(p: &Painter, e: &Entry, r: Rect) {
                 StrokeKind::Outside,
             );
         }
+        e.paint_link_badge(p, r, true);
     } else {
         e.paint_icon(p, r, true);
     }

@@ -70,6 +70,11 @@ pub struct Entry {
     pub thumbnail: Option<egui::TextureId>,
     /// Pixel size (width, height) of `thumbnail`, so it can be drawn at its original aspect ratio.
     pub thumb_size: Option<(u32, u32)>,
+    /// A symbolic link. It is drawn with its target's icon plus a small link badge.
+    pub is_link: bool,
+    /// Lowercased file name of a link's target; icons are chosen from it instead of `name`, so
+    /// a link looks like the thing it points to.
+    pub icon_name_lc: Option<String>,
 }
 
 impl Entry {
@@ -106,6 +111,8 @@ impl Entry {
             accessed: None,
             thumbnail: None,
             thumb_size: None,
+            is_link: false,
+            icon_name_lc: None,
         }
     }
 
@@ -120,7 +127,7 @@ impl Entry {
         match self.kind {
             EntryKind::Folder => Icon::Folder,
             EntryKind::Drive => Icon::Drive,
-            EntryKind::File => extension(&self.name)
+            EntryKind::File => extension(self.icon_name_lc.as_deref().unwrap_or(&self.name))
                 .map(icon_for_extension)
                 .unwrap_or(Icon::File),
         }
@@ -129,13 +136,23 @@ impl Entry {
     /// Paint this entry's icon. A user-supplied `extension.<ext>.svg|png` icon from the icon
     /// directory (see `icons::paint_extension_icon`) wins over the built-in per-type icon.
     pub fn paint_icon(&self, painter: &egui::Painter, rect: egui::Rect, enabled: bool) {
+        let name_lc = self.icon_name_lc.as_deref().unwrap_or(&self.name_lc);
         if self.icon.is_none()
             && self.kind == EntryKind::File
-            && crate::icons::paint_extension_icon(&self.name_lc, painter, rect, enabled)
+            && crate::icons::paint_extension_icon(name_lc, painter, rect, enabled)
         {
+            self.paint_link_badge(painter, rect, enabled);
             return;
         }
         self.icon().paint(painter, rect, enabled);
+        self.paint_link_badge(painter, rect, enabled);
+    }
+
+    /// The small link badge over a symbolic link's icon (nothing for other entries).
+    pub fn paint_link_badge(&self, painter: &egui::Painter, rect: egui::Rect, enabled: bool) {
+        if self.is_link {
+            Icon::LinkOverlay.paint(painter, rect, enabled);
+        }
     }
 
     /// Name as displayed (honours "File name extensions").
@@ -308,6 +325,76 @@ pub enum RibbonMode {
     Hidden,
 }
 
+/// Kinds of file the "New" menu can create besides folders and text documents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NewFileKind {
+    /// A script without an extension (`Program`), executable, ready to be filled in.
+    Executable,
+    Python,
+    Shell,
+    Markdown,
+    Svg,
+}
+
+impl NewFileKind {
+    pub const ALL: [NewFileKind; 5] = [
+        NewFileKind::Executable,
+        NewFileKind::Python,
+        NewFileKind::Shell,
+        NewFileKind::Markdown,
+        NewFileKind::Svg,
+    ];
+
+    /// Label in the New menus.
+    pub fn label(self) -> &'static str {
+        match self {
+            NewFileKind::Executable => "Executable file (no extension)",
+            NewFileKind::Python => "Python script (.py)",
+            NewFileKind::Shell => "Shell script (.sh)",
+            NewFileKind::Markdown => "Markdown document (.md)",
+            NewFileKind::Svg => "SVG image (.svg)",
+        }
+    }
+
+    /// Name the new file starts with (made unique by the host, then put into rename mode).
+    pub fn default_name(self) -> &'static str {
+        match self {
+            NewFileKind::Executable => "Program",
+            NewFileKind::Python => "script.py",
+            NewFileKind::Shell => "script.sh",
+            NewFileKind::Markdown => "README.md",
+            NewFileKind::Svg => "image.svg",
+        }
+    }
+
+    /// Initial contents.
+    pub fn template(self) -> &'static str {
+        match self {
+            NewFileKind::Executable | NewFileKind::Shell => "#!/usr/bin/env bash\n\n",
+            NewFileKind::Python => "#!/usr/bin/env python3\n\n",
+            NewFileKind::Markdown => "# \n",
+            NewFileKind::Svg => {
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"256\" height=\"256\" \
+                 viewBox=\"0 0 256 256\">\n</svg>\n"
+            }
+        }
+    }
+
+    /// Whether the file gets its execute bit.
+    pub fn executable(self) -> bool {
+        matches!(self, NewFileKind::Executable | NewFileKind::Shell)
+    }
+
+    pub fn icon(self) -> Icon {
+        match self {
+            NewFileKind::Executable => Icon::FileExec,
+            NewFileKind::Python | NewFileKind::Shell => Icon::FileCode,
+            NewFileKind::Markdown => Icon::FileText,
+            NewFileKind::Svg => Icon::FileImage,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
@@ -337,6 +424,8 @@ pub enum Command {
     // New
     NewFolder,
     NewTextFile,
+    /// Create an empty script/document of the given kind (executable, .py, .sh, .md, .svg).
+    NewFile(NewFileKind),
     NewShortcut,
     // Open
     Open,
@@ -1710,6 +1799,7 @@ impl ExplorerState {
                     | Command::PasteShortcut
                     | Command::NewFolder
                     | Command::NewTextFile
+                    | Command::NewFile(..)
                     | Command::NewShortcut
                     | Command::OpenTerminal
             )

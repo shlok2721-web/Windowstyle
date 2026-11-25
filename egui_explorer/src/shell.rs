@@ -592,6 +592,23 @@ fn icon_button(ui: &mut Ui, rect: Rect, id: Id, icon: Icon, enabled: bool, tip: 
     resp.on_hover_text(tip)
 }
 
+/// Icon of the navigation-tree node for `path`, if the tree has one (searches loaded nodes only).
+fn nav_icon_of(nodes: &[NavNode], path: &Path) -> Option<Icon> {
+    for n in nodes {
+        if n.path == path {
+            return Some(n.icon);
+        }
+        if let Some(found) = n
+            .children
+            .as_deref()
+            .and_then(|children| nav_icon_of(children, path))
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
 fn command_meta(cmd: Command) -> (Icon, &'static str) {
     match cmd {
         Command::Properties => (Icon::Properties, "Properties"),
@@ -1591,7 +1608,8 @@ fn address_bar(ui: &mut Ui, state: &mut ExplorerState, rect: Rect) {
     } else if state.location == Path::new("/") {
         Icon::Drive
     } else {
-        Icon::Folder
+        // Downloads, Documents, ... keep their own icon in the address bar too.
+        nav_icon_of(&state.nav, &state.location).unwrap_or(Icon::Folder)
     };
     location_icon.paint(ui.painter(), icon_rect, true);
 

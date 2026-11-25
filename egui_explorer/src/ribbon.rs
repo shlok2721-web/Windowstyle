@@ -339,6 +339,32 @@ impl Ribbon {
                                     M::item("Folder", C::NewFolder).icon(I::Folder),
                                     M::item("Shortcut", C::NewShortcut).icon(I::PasteShortcut),
                                     M::item("Text Document", C::NewTextFile).icon(I::FileText),
+                                    M::Sep,
+                                    M::item(
+                                        NewFileKind::Executable.label(),
+                                        C::NewFile(NewFileKind::Executable),
+                                    )
+                                    .icon(NewFileKind::Executable.icon()),
+                                    M::item(
+                                        NewFileKind::Python.label(),
+                                        C::NewFile(NewFileKind::Python),
+                                    )
+                                    .icon(NewFileKind::Python.icon()),
+                                    M::item(
+                                        NewFileKind::Shell.label(),
+                                        C::NewFile(NewFileKind::Shell),
+                                    )
+                                    .icon(NewFileKind::Shell.icon()),
+                                    M::item(
+                                        NewFileKind::Markdown.label(),
+                                        C::NewFile(NewFileKind::Markdown),
+                                    )
+                                    .icon(NewFileKind::Markdown.icon()),
+                                    M::item(
+                                        NewFileKind::Svg.label(),
+                                        C::NewFile(NewFileKind::Svg),
+                                    )
+                                    .icon(NewFileKind::Svg.icon()),
                                 ],
                             ),
                             Button::dropdown(
@@ -376,6 +402,14 @@ impl Ribbon {
                             Button::new("History", I::History, C::ShowHistory),
                         ]),
                     ],
+                },
+                Group {
+                    title: "Security",
+                    items: vec![Item::Large(Button::new(
+                        "Permissions",
+                        I::Properties,
+                        C::AdvancedSecurity,
+                    ))],
                 },
                 Group {
                     title: "Select",
@@ -418,14 +452,6 @@ impl Ribbon {
                         Item::Large(Button::new("Zip", I::Compress, C::ShowCompressOptions)),
                         Item::Large(Button::new("Print", I::Print, C::Print)),
                     ],
-                },
-                Group {
-                    title: "Security",
-                    items: vec![Item::Large(Button::new(
-                        "Permissions",
-                        I::Properties,
-                        C::AdvancedSecurity,
-                    ))],
                 },
             ],
         };
