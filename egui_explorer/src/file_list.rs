@@ -677,10 +677,10 @@ fn swipe_navigation(ui: &Ui, acts: &mut Vec<Act>) {
         if !fired {
             acc += d.x;
             if acc >= SWIPE_THRESHOLD {
-                acts.push(Act::Cmd(Command::Forward));
+                acts.push(Act::Cmd(Command::Back));
                 fired = true;
             } else if acc <= -SWIPE_THRESHOLD {
-                acts.push(Act::Cmd(Command::Back));
+                acts.push(Act::Cmd(Command::Forward));
                 fired = true;
             }
         }
