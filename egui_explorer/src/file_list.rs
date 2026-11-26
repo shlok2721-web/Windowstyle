@@ -587,7 +587,25 @@ fn show_history(ui: &mut Ui, state: &mut ExplorerState) {
 
     state.view = files_view;
     state.scope = ListScope::FilesOnly;
+    // Recent files: the Name column takes 40 % of the width, the other columns share 60 %.
+    let saved_widths: Vec<f32> = state.columns.iter().map(|c| c.width).collect();
+    let others = state
+        .columns
+        .iter()
+        .filter(|c| c.visible && c.key != SortKey::Name)
+        .count();
+    let total = (avail.x - 12.0).max(320.0);
+    for c in state.columns.iter_mut() {
+        if c.key == SortKey::Name {
+            c.width = if others == 0 { total } else { total * 0.4 };
+        } else if c.visible && others > 0 {
+            c.width = (total * 0.6 / others as f32).max(40.0);
+        }
+    }
     show_pane(ui, state);
+    for (c, w) in state.columns.iter_mut().zip(saved_widths) {
+        c.width = w;
+    }
     state.scope = ListScope::All;
 }
 
@@ -613,23 +631,44 @@ fn show_pane(ui: &mut Ui, state: &mut ExplorerState) {
 }
 
 /// Accumulated sideways scroll (points) that counts as one back/forward swipe.
-const SWIPE_THRESHOLD: f32 = 150.0;
+const SWIPE_THRESHOLD: f32 = 120.0;
 
 /// Two-finger horizontal swipe on the file list: right = Back, left = Forward (with "natural
-/// scrolling"; flip the two commands below if your touchpad is set the other way round). It
-/// runs after the list's scroll areas, so a view that really scrolls sideways keeps the
-/// gesture for itself. One swipe navigates once, however long its momentum tail is.
+/// scrolling"; flip the two commands below if your touchpad is set the other way round).
+/// It reads the raw wheel events, because the list's own scroll areas swallow the smoothed
+/// scroll delta. One swipe navigates once, however long its momentum tail is.
 fn swipe_navigation(ui: &Ui, acts: &mut Vec<Act>) {
     let id = Id::unique("fl_swipe");
     let ctx = ui.ctx();
-    let d = ctx.input(|i| i.smooth_scroll_delta);
-    let (mut acc, mut fired): (f32, bool) = ctx.data(|m| m.get_temp(id)).unwrap_or((0.0, false));
+    if !ui.rect_contains_pointer(ui.max_rect()) {
+        return;
+    }
+    let (now, d) = ctx.input(|i| {
+        let mut d = Vec2::ZERO;
+        for ev in &i.events {
+            if let egui::Event::MouseWheel { unit, delta, .. } = ev {
+                let k = match unit {
+                    egui::MouseWheelUnit::Point => 1.0,
+                    egui::MouseWheelUnit::Line => 24.0,
+                    egui::MouseWheelUnit::Page => 400.0,
+                };
+                d += *delta * k;
+            }
+        }
+        (i.time, d)
+    });
     if d == Vec2::ZERO {
+        return;
+    }
+    // (accumulated sideways scroll, already navigated for this swipe, time of last event)
+    let (mut acc, mut fired, last): (f32, bool, f64) =
+        ctx.data(|m| m.get_temp(id)).unwrap_or((0.0, false, f64::NEG_INFINITY));
+    if now - last > 0.3 {
+        // A pause ends the previous swipe.
         acc = 0.0;
         fired = false;
-    } else if !ui.rect_contains_pointer(ui.max_rect()) {
-        return;
-    } else if d.x.abs() > d.y.abs() * 2.0 {
+    }
+    if d.x.abs() > d.y.abs() {
         if !fired {
             acc += d.x;
             if acc >= SWIPE_THRESHOLD {
@@ -640,10 +679,10 @@ fn swipe_navigation(ui: &Ui, acts: &mut Vec<Act>) {
                 fired = true;
             }
         }
-    } else if d.y.abs() > d.x.abs() * 2.0 {
+    } else {
         acc = 0.0;
     }
-    ctx.data_mut(|m| m.insert_temp(id, (acc, fired)));
+    ctx.data_mut(|m| m.insert_temp(id, (acc, fired, now)));
 }
 
 fn render(
@@ -1061,6 +1100,10 @@ fn draw_content(
 
     // ---- items --------------------------------------------------------------------
     let touch_gesture = finished_touch_gesture(&ctx);
+    crate::quadtap::ensure_started(&ctx);
+    let quad_pending = ui.input(|i| i.viewport().focused.unwrap_or(true))
+        && crate::quadtap::pending();
+    let quad_pos = ctx.input(|i| i.pointer.latest_pos());
     let last_click_id = Id::unique("fl_last_click");
     let now_drag = egui::DragAndDrop::has_payload_of_type::<Vec<PathBuf>>(&ctx);
     // Only items in or just around the viewport are ever materialised.
@@ -1195,7 +1238,12 @@ fn draw_content(
             let gesture_fingers = touch_gesture
                 .filter(|(_, pos)| r.contains(*pos))
                 .map(|(n, _)| n);
-            let want_delete = gesture_fingers.is_some_and(|n| n >= 4)
+            // A four-finger click read straight from the touchpad (see `quadtap`).
+            let quad_here = quad_pending
+                && quad_pos.is_some_and(|p| r.contains(p))
+                && crate::quadtap::consume();
+            let want_delete = quad_here
+                || gesture_fingers.is_some_and(|n| n >= 4)
                 || (middle && mods.ctrl && mods.shift);
             let want_copy = !want_delete && (gesture_fingers == Some(3) || middle);
             if want_delete {
@@ -1611,7 +1659,12 @@ fn paint_item(
     if f.faded {
         p.multiply_opacity(0.5);
     }
-    let font = theme::font();
+    // Quick access lists the recently opened files 2 pt larger than the normal list font.
+    let font = if st.in_quick_access() && st.scope == ListScope::FilesOnly {
+        egui::FontId::new(theme::BASE_FONT + 2.0, egui::FontFamily::Proportional)
+    } else {
+        theme::font()
+    };
     let small = theme::font_small();
     let name = e.display_name(st.show_extensions);
     let cb = st.item_check_boxes;

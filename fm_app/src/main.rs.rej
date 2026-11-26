@@ -1,0 +1,12 @@
+--- fm_app/src/main.rs	2026-11-26 17:37:53.845689005 +0530
++++ fm_app/src/main.rs	2026-11-26 17:33:50.462149661 +0530
+@@ -2373,6 +2373,9 @@
+                     EntryKind::File
+                 },
+             );
++            if is_dir {
++                e.icon = special_folder_icon(&path);
++            }
+             e.accessed = Some(UNIX_EPOCH + Duration::from_secs(at));
+             e.modified = meta.modified().ok();
+             if !is_dir {

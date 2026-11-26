@@ -378,6 +378,14 @@ impl Ribbon {
                     ],
                 },
                 Group {
+                    title: "Security",
+                    items: vec![Item::Large(Button::new(
+                        "Permissions",
+                        I::Properties,
+                        C::AdvancedSecurity,
+                    ))],
+                },
+                Group {
                     title: "Select",
                     items: vec![Item::Stack(vec![
                         Button::new("Select all", I::SelectAll, C::SelectAll)
@@ -418,14 +426,6 @@ impl Ribbon {
                         Item::Large(Button::new("Zip", I::Compress, C::ShowCompressOptions)),
                         Item::Large(Button::new("Print", I::Print, C::Print)),
                     ],
-                },
-                Group {
-                    title: "Security",
-                    items: vec![Item::Large(Button::new(
-                        "Permissions",
-                        I::Properties,
-                        C::AdvancedSecurity,
-                    ))],
                 },
             ],
         };

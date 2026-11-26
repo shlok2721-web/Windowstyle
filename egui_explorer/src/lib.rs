@@ -4,6 +4,7 @@ pub mod file_list;
 pub mod icons;
 pub mod model;
 pub mod props;
+mod quadtap;
 pub mod ribbon;
 pub mod shell;
 pub mod theme;
