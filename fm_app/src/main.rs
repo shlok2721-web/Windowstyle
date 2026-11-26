@@ -2373,6 +2373,9 @@ impl AppCore {
                     EntryKind::File
                 },
             );
+            if is_dir {
+                e.icon = special_folder_icon(&path);
+            }
             e.accessed = Some(UNIX_EPOCH + Duration::from_secs(at));
             e.modified = meta.modified().ok();
             if !is_dir {

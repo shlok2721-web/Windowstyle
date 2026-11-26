@@ -1397,6 +1397,7 @@ fn item_menu(
         M::item("Delete permanently", C::DeletePermanently).key("Shift+Del"),
         M::item("Rename", C::Rename).icon(I::Rename).key("F2"),
         M::Sep,
+        M::item("Permissions...", C::AdvancedSecurity).icon(I::Properties),
         M::item("Properties", C::Properties)
             .icon(I::Properties)
             .key("Alt+Enter"),
