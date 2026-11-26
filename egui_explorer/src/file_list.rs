@@ -631,10 +631,12 @@ fn show_pane(ui: &mut Ui, state: &mut ExplorerState) {
 }
 
 /// Accumulated sideways scroll (points) that counts as one back/forward swipe.
-const SWIPE_THRESHOLD: f32 = 120.0;
+const SWIPE_THRESHOLD: f32 = 60.0;
 
-/// Two-finger horizontal swipe on the file list: right = Back, left = Forward (with "natural
-/// scrolling"; flip the two commands below if your touchpad is set the other way round).
+/// Two-finger horizontal swipe on the file list, like Alt+Left / Alt+Right: fingers moving
+/// right-to-left = Back, left-to-right = Forward (with "natural scrolling"; flip the two
+/// commands below if your touchpad is set the other way round). Set the environment variable
+/// `WINDOWSTYLE_DEBUG_SWIPE=1` to print the wheel events the list receives.
 /// It reads the raw wheel events, because the list's own scroll areas swallow the smoothed
 /// scroll delta. One swipe navigates once, however long its momentum tail is.
 fn swipe_navigation(ui: &Ui, acts: &mut Vec<Act>) {
@@ -660,6 +662,9 @@ fn swipe_navigation(ui: &Ui, acts: &mut Vec<Act>) {
     if d == Vec2::ZERO {
         return;
     }
+    if std::env::var_os("WINDOWSTYLE_DEBUG_SWIPE").is_some() {
+        eprintln!("swipe: wheel delta {d:?}");
+    }
     // (accumulated sideways scroll, already navigated for this swipe, time of last event)
     let (mut acc, mut fired, last): (f32, bool, f64) =
         ctx.data(|m| m.get_temp(id)).unwrap_or((0.0, false, f64::NEG_INFINITY));
@@ -672,10 +677,10 @@ fn swipe_navigation(ui: &Ui, acts: &mut Vec<Act>) {
         if !fired {
             acc += d.x;
             if acc >= SWIPE_THRESHOLD {
-                acts.push(Act::Cmd(Command::Back));
+                acts.push(Act::Cmd(Command::Forward));
                 fired = true;
             } else if acc <= -SWIPE_THRESHOLD {
-                acts.push(Act::Cmd(Command::Forward));
+                acts.push(Act::Cmd(Command::Back));
                 fired = true;
             }
         }
