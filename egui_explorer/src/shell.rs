@@ -1081,7 +1081,7 @@ fn info_window_id(viewport_id: egui::ViewportId, session: u32) -> Id {
     Id::unique(("exp_info_window", viewport_id, session))
 }
 
-const HELP_KEYS: [(&str, &str); 31] = [
+const HELP_KEYS: [(&str, &str); 35] = [
     ("Ctrl+C / X / V", "Copy / Cut / Paste"),
     ("Ctrl+Shift+C", "Copy full path(s)"),
     ("Ctrl+Alt+C", "Copy file name(s)"),
@@ -1112,6 +1112,10 @@ const HELP_KEYS: [(&str, &str); 31] = [
     ("Alt+Shift+P", "Toggle details pane"),
     ("Ctrl+Shift+1..8", "Change view"),
     ("Ctrl+F1", "Minimize / expand the Ribbon"),
+    ("Fast double click", "Open (second click within 0.5 s)"),
+    ("Click, pause, click", "Rename (second click after 0.5-1.5 s)"),
+    ("3-finger click", "Copy the item under the pointer"),
+    ("4-finger click", "Delete permanently (asks first)"),
     ("F1", "This help"),
 ];
 
@@ -1196,14 +1200,16 @@ fn info_windows(ctx: &egui::Context, state: &mut ExplorerState) {
     } else {
         Vec::new()
     };
-    // Security: only regular files can be changed (a folder needs its execute bit to be
-    // enterable, so flipping it to e.g. "read only" would lock the user out of it).
+    // Security: files and folders can be changed (drives cannot). A folder always keeps the
+    // owner's execute bit, which it needs to be enterable (see `PermMode::apply_to_dir_mode`).
     let mut sec_targets: Vec<PathBuf> = Vec::new();
     let mut sec_skipped = 0usize;
+    let mut sec_has_dirs = false;
     let mut sec_current = String::new();
     if kind == InfoWindow::Security {
         for e in state.selected_entries() {
-            if e.kind == EntryKind::File {
+            if e.kind == EntryKind::File || e.kind == EntryKind::Folder {
+                sec_has_dirs |= e.kind == EntryKind::Folder;
                 sec_targets.push(e.path.clone());
             } else {
                 sec_skipped += 1;
@@ -1295,8 +1301,8 @@ fn info_windows(ctx: &egui::Context, state: &mut ExplorerState) {
                     if sec_targets.is_empty() {
                         ui.add(
                             egui::Label::new(
-                                "Select one or more files to change their permissions. \
-                                 Folders and drives are not changed here.",
+                                "Select one or more files or folders to change their permissions. \
+                                 Drives are not changed here.",
                             )
                             .wrap(),
                         );
@@ -1308,7 +1314,7 @@ fn info_windows(ctx: &egui::Context, state: &mut ExplorerState) {
                                     .map(|n| n.to_string_lossy().into_owned())
                                     .unwrap_or_default()
                             ),
-                            many => format!("Permissions for {} files", many.len()),
+                            many => format!("Permissions for {} items", many.len()),
                         };
                         ui.label(RichText::new(summary).color(colors::text()));
                         if !sec_current.is_empty() {
@@ -1323,8 +1329,14 @@ fn info_windows(ctx: &egui::Context, state: &mut ExplorerState) {
                         let mut note = String::from(
                             "Applies to the owner. Group and others never gain access.",
                         );
+                        if sec_has_dirs {
+                            note.push_str(
+                                " Folders always keep the owner's execute bit so they \
+                                 can still be opened.",
+                            );
+                        }
                         if sec_skipped > 0 {
-                            note.push_str(&format!(" {sec_skipped} folder(s)/drive(s) skipped."));
+                            note.push_str(&format!(" {sec_skipped} drive(s) skipped."));
                         }
                         ui.label(RichText::new(note).small().color(colors::text_secondary()));
                     }
@@ -1635,6 +1647,16 @@ fn address_bar(ui: &mut Ui, state: &mut ExplorerState, rect: Rect) {
                     && let Some(h) = std::env::var_os("HOME")
                 {
                     t = format!("{}{}", h.to_string_lossy(), rest);
+                }
+                // Typing the name of a virtual overview opens it, like typing a path.
+                let lower = t.to_lowercase();
+                if matches!(
+                    lower.as_str(),
+                    "quick access" | "quick-access" | "quickaccess" | "quick-access://"
+                ) {
+                    t = QUICK_ACCESS_LOCATION.to_owned();
+                } else if matches!(lower.as_str(), "this pc" | "this-pc" | "thispc") {
+                    t = THIS_PC_LOCATION.to_owned();
                 }
                 if !t.is_empty() {
                     state.navigate(PathBuf::from(t));

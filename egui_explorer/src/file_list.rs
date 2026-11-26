@@ -23,6 +23,13 @@ use crate::theme::{self, colors};
 /// delta 1:1, which feels slow next to other applications; raise it for faster scrolling.
 pub(crate) const SCROLL_SPEED: f32 = 2.5;
 
+/// Two clicks on the same item at most this far apart (seconds) are a "fast" double click:
+/// they open the file or folder.
+pub(crate) const OPEN_CLICK_MAX_SECS: f64 = 0.5;
+/// A second click on the same (already selected) item after more than `OPEN_CLICK_MAX_SECS`
+/// but within this many seconds starts an inline rename, like slow-clicking in Explorer.
+pub(crate) const RENAME_CLICK_MAX_SECS: f64 = 1.5;
+
 const ROW_H: f32 = 22.0;
 const CONTENT_ROW_H: f32 = 54.0;
 const HEADER_H: f32 = 24.0;
@@ -592,6 +599,9 @@ fn show_pane(ui: &mut Ui, state: &mut ExplorerState) {
     {
         let st: &ExplorerState = state;
         render(ui, st, &set, &mut renaming, &mut acts);
+        if renaming.is_none() {
+            swipe_navigation(ui, &mut acts);
+        }
     }
     // A rename that was committed/cancelled this frame comes back as an action.
     let finished = acts.iter().any(|a| matches!(a, Act::Rename(..)))
@@ -600,6 +610,40 @@ fn show_pane(ui: &mut Ui, state: &mut ExplorerState) {
             .is_some_and(|r| r.path.as_os_str().is_empty());
     state.renaming = if finished { None } else { renaming };
     apply(state, acts);
+}
+
+/// Accumulated sideways scroll (points) that counts as one back/forward swipe.
+const SWIPE_THRESHOLD: f32 = 150.0;
+
+/// Two-finger horizontal swipe on the file list: right = Back, left = Forward (with "natural
+/// scrolling"; flip the two commands below if your touchpad is set the other way round). It
+/// runs after the list's scroll areas, so a view that really scrolls sideways keeps the
+/// gesture for itself. One swipe navigates once, however long its momentum tail is.
+fn swipe_navigation(ui: &Ui, acts: &mut Vec<Act>) {
+    let id = Id::unique("fl_swipe");
+    let ctx = ui.ctx();
+    let d = ctx.input(|i| i.smooth_scroll_delta);
+    let (mut acc, mut fired): (f32, bool) = ctx.data(|m| m.get_temp(id)).unwrap_or((0.0, false));
+    if d == Vec2::ZERO {
+        acc = 0.0;
+        fired = false;
+    } else if !ui.rect_contains_pointer(ui.max_rect()) {
+        return;
+    } else if d.x.abs() > d.y.abs() * 2.0 {
+        if !fired {
+            acc += d.x;
+            if acc >= SWIPE_THRESHOLD {
+                acts.push(Act::Cmd(Command::Back));
+                fired = true;
+            } else if acc <= -SWIPE_THRESHOLD {
+                acts.push(Act::Cmd(Command::Forward));
+                fired = true;
+            }
+        }
+    } else if d.y.abs() > d.x.abs() * 2.0 {
+        acc = 0.0;
+    }
+    ctx.data_mut(|m| m.insert_temp(id, (acc, fired)));
 }
 
 fn render(
@@ -1016,6 +1060,8 @@ fn draw_content(
     });
 
     // ---- items --------------------------------------------------------------------
+    let touch_gesture = finished_touch_gesture(&ctx);
+    let last_click_id = Id::unique("fl_last_click");
     let now_drag = egui::DragAndDrop::has_payload_of_type::<Vec<PathBuf>>(&ctx);
     // Only items in or just around the viewport are ever materialised.
     let mut visible: Vec<(usize, usize, Rect)> = Vec::new();
@@ -1115,6 +1161,59 @@ fn draw_content(
                 });
             } else if resp.clicked_by(PointerButton::Primary) {
                 acts.push(click_selection(st, layout, k, mods));
+                // Click timing: a fast second click opens, a slower one renames.
+                let plain = !mods.ctrl && !mods.shift && !mods.alt && !mods.command;
+                let now = ctx.input(|i| i.time);
+                let last: Option<(PathBuf, f64)> = ctx.data(|d| d.get_temp(last_click_id));
+                let mut next = plain.then(|| (e.path.clone(), now));
+                if plain && let Some((p, t)) = last && p == e.path {
+                    let dt = now - t;
+                    if dt <= OPEN_CLICK_MAX_SECS {
+                        acts.push(Act::Open(e.path.clone(), e.is_dir()));
+                        next = None;
+                    } else if dt <= RENAME_CLICK_MAX_SECS
+                        && selected
+                        && st.selection.len() == 1
+                    {
+                        acts.push(Act::Cmd(Command::Rename));
+                        next = None;
+                    }
+                }
+                ctx.data_mut(|d| {
+                    if let Some(v) = next {
+                        d.insert_temp(last_click_id, v);
+                    } else {
+                        d.remove_temp::<(PathBuf, f64)>(last_click_id);
+                    }
+                });
+            }
+            // Multi-finger gestures on an item. Touchscreen: 3 fingers copy, 4+ delete
+            // permanently. Touchpad / mouse: a three-finger click arrives as a middle click
+            // (copy); Ctrl+Shift+middle click stands in for the four-finger click (touchpads
+            // cannot report four fingers). Delete always asks for confirmation first.
+            let middle = resp.clicked_by(PointerButton::Middle);
+            let gesture_fingers = touch_gesture
+                .filter(|(_, pos)| r.contains(*pos))
+                .map(|(n, _)| n);
+            let want_delete = gesture_fingers.is_some_and(|n| n >= 4)
+                || (middle && mods.ctrl && mods.shift);
+            let want_copy = !want_delete && (gesture_fingers == Some(3) || middle);
+            if want_delete {
+                acts.push(Act::Select {
+                    sel: HashSet::from([e.path.clone()]),
+                    focus: Some(e.path.clone()),
+                    anchor: Some(e.path.clone()),
+                });
+                acts.push(Act::Cmd(Command::DeletePermanently));
+            } else if want_copy {
+                if !selected {
+                    acts.push(Act::Select {
+                        sel: HashSet::from([e.path.clone()]),
+                        focus: Some(e.path.clone()),
+                        anchor: Some(e.path.clone()),
+                    });
+                }
+                acts.push(Act::Cmd(Command::Copy));
             }
             if resp.secondary_clicked() && !selected {
                 acts.push(Act::Select {
@@ -1122,9 +1221,6 @@ fn draw_content(
                     focus: Some(e.path.clone()),
                     anchor: Some(e.path.clone()),
                 });
-            }
-            if resp.double_clicked_by(PointerButton::Primary) && !box_clicked {
-                acts.push(Act::Open(e.path.clone(), e.is_dir()));
             }
             context_menu(&resp, |ui| {
                 // Built only while the menu is open: it depends on what is selected.
@@ -1161,6 +1257,33 @@ fn draw_content(
     if let Some(c) = picked {
         acts.push(Act::Cmd(c));
     }
+}
+
+/// Multi-finger touch gestures (touchscreens): the number of fingers that touched together
+/// and where, reported once when the gesture ends. Three fingers copy, four or more delete.
+/// (Touchpads never send finger counts to applications: libinput turns a three-finger click
+/// into a middle click, which is handled as "copy" on the item itself.)
+fn finished_touch_gesture(ctx: &egui::Context) -> Option<(usize, egui::Pos2)> {
+    let id = Id::unique("fl_touch_gesture");
+    let n = ctx.input(|i| i.multi_touch().map_or(0, |m| m.num_touches));
+    let state: Option<(usize, egui::Pos2)> = ctx.data(|d| d.get_temp(id));
+    if n >= 3 {
+        let pos = state
+            .map(|(_, p)| p)
+            .or_else(|| ctx.input(|i| i.pointer.latest_pos()));
+        if let Some(pos) = pos {
+            let max = state.map_or(n, |(m, _)| m.max(n));
+            ctx.data_mut(|d| d.insert_temp(id, (max, pos)));
+        }
+        return None;
+    }
+    if n < 2
+        && let Some(done) = state
+    {
+        ctx.data_mut(|d| d.remove_temp::<(usize, egui::Pos2)>(id));
+        return Some(done);
+    }
+    None
 }
 
 fn click_selection(st: &ExplorerState, layout: &Layout<'_>, k: usize, mods: Modifiers) -> Act {

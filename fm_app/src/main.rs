@@ -330,15 +330,30 @@ fn normalize_poll_secs(secs: u32) -> u32 {
     if secs == 0 { 0 } else { secs.clamp(5, 20) }
 }
 
+/// Whether a command-line argument names the Quick access view (`quick-access://`,
+/// `quick-access`, `quickaccess`, `quick_access`; case-insensitive).
+fn is_quick_access_arg(arg: &str) -> bool {
+    matches!(
+        arg.trim().trim_end_matches('/').to_ascii_lowercase().as_str(),
+        "quick-access:" | "quick-access" | "quickaccess" | "quick_access"
+    )
+}
+
 fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let frameless = args.iter().any(|a| a == "--frameless");
     // `file-manager [FOLDER]`: a folder to open. Flags all start with `--`.
-    let cli_path = args
-        .iter()
-        .find(|a| !a.starts_with("--"))
-        .map(PathBuf::from)
-        .and_then(|path| fs::canonicalize(path).ok());
+    // `file-manager --quick-access` (or `file-manager quick-access://`) opens straight into the
+    // Quick access view instead of a folder.
+    let wants_quick_access = args.iter().any(|a| a == "--quick-access" || is_quick_access_arg(a));
+    let cli_path = if wants_quick_access {
+        Some(PathBuf::from(QUICK_ACCESS_ID))
+    } else {
+        args.iter()
+            .find(|a| !a.starts_with("--"))
+            .map(PathBuf::from)
+            .and_then(|path| fs::canonicalize(path).ok())
+    };
     // One process for every window: a second launch hands its folder to the running instance
     // (which opens a new window) and exits. `--new-instance` opts out.
     let listener = if args.iter().any(|a| a == "--new-instance") {
@@ -821,6 +836,9 @@ impl AppCore {
 
         let user_pins: Vec<PathBuf> = behavior.pins().cloned().collect();
         state.nav = build_nav(&user_pins, settings.nav.this_pc_expanded);
+        let start_in_quick_access = cli_start
+            .as_deref()
+            .is_some_and(|path| path == Path::new(QUICK_ACCESS_ID));
         let start = cli_start
             .filter(|path| path.is_dir())
             .or_else(|| {
@@ -966,7 +984,13 @@ impl AppCore {
         if !hooks.signals {
             eprintln!("Could not install signal handlers; state is flushed only on window close.");
         }
-        app.behavior.open_dir(&app.state.location, started_at);
+        if start_in_quick_access {
+            // Straight into the Quick access view (the folder above is only the fallback that
+            // "Back" returns to).
+            app.navigate(PathBuf::from(QUICK_ACCESS_ID));
+        } else {
+            app.behavior.open_dir(&app.state.location, started_at);
+        }
         app.apply_watch_plan();
         app
     }
@@ -1066,7 +1090,7 @@ impl AppCore {
         let mut first_error: Option<String> = None;
         for path in &targets {
             let md = match fs::metadata(path) {
-                Ok(md) if md.is_file() => md,
+                Ok(md) if md.is_file() || md.is_dir() => md,
                 Ok(_) => {
                     skipped += 1;
                     continue;
@@ -1077,7 +1101,11 @@ impl AppCore {
                     continue;
                 }
             };
-            let new_mode = mode.apply_to_mode(md.permissions().mode());
+            let new_mode = if md.is_dir() {
+                mode.apply_to_dir_mode(md.permissions().mode())
+            } else {
+                mode.apply_to_mode(md.permissions().mode())
+            };
             match fs::set_permissions(path, fs::Permissions::from_mode(new_mode)) {
                 Ok(()) => changed += 1,
                 Err(error) => {
@@ -1093,12 +1121,12 @@ impl AppCore {
             )
         } else if skipped > 0 {
             format!(
-                "Permissions set to \"{}\" on {changed} file(s); {skipped} skipped.",
+                "Permissions set to \"{}\" on {changed} item(s); {skipped} skipped.",
                 mode.label()
             )
         } else {
             format!(
-                "Permissions set to \"{}\" on {changed} file(s).",
+                "Permissions set to \"{}\" on {changed} item(s).",
                 mode.label()
             )
         };
@@ -3751,7 +3779,8 @@ impl AppCore {
             path.display(),
             workspace_target
         );
-        let start = if path.is_dir() {
+        let start_in_quick_access = path == Path::new(QUICK_ACCESS_ID);
+        let start = if start_in_quick_access || path.is_dir() {
             path
         } else {
             dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
@@ -3765,16 +3794,26 @@ impl AppCore {
         state.nav = build_nav(&pins, self.settings.nav.this_pc_expanded);
         // Do not scan the requested folder on the UI thread. This process may already be
         // managing other windows, so blocking here would delay their close/input events too.
-        state.set_location(start.clone(), Vec::new());
+        if start_in_quick_access {
+            // The history view is built from the in-memory behaviour log: no disk scan needed.
+            let entries = self.history_entries();
+            state.set_location(start.clone(), entries);
+        } else {
+            state.set_location(start.clone(), Vec::new());
+        }
         let mut watcher = fm_notify::DirWatcher::new({
             let wake_ctx = ctx.clone();
             move || wake_ctx.request_repaint()
         })
         .ok();
-        if let Some(watcher) = watcher.as_mut() {
+        if let Some(watcher) = watcher.as_mut()
+            && !start_in_quick_access
+        {
             let _ = watcher.set_dir(Some(&start));
         }
-        self.behavior.open_dir(&start, unix_now());
+        if !start_in_quick_access {
+            self.behavior.open_dir(&start, unix_now());
+        }
         self.apply_watch_plan();
         self.window_serial = self.window_serial.wrapping_add(1);
         let serial = self.window_serial;
@@ -3813,7 +3852,11 @@ impl AppCore {
             search_generation: 0,
             current_window: serial,
             search_results: Vec::new(),
-            status: "Loading folder…".into(),
+            status: if start_in_quick_access {
+                String::new()
+            } else {
+                "Loading folder…".into()
+            },
             status_seen: String::new(),
             status_seen_at: Instant::now(),
         });
@@ -3823,17 +3866,22 @@ impl AppCore {
         let listing_sender = self.worker_sender.clone();
         let listing_ctx = self.egui_ctx.clone();
         let listing_path = start.clone();
-        let listing_spawn = thread::Builder::new()
-            .name("file-manager-window-listing".into())
-            .spawn(move || {
-                let entries = load_dir(&listing_path, true);
-                let _ = listing_sender.send(WorkerMessage::WindowLoaded {
-                    serial,
-                    path: listing_path,
-                    entries,
-                });
-                listing_ctx.request_repaint();
-            });
+        let listing_spawn = if start_in_quick_access {
+            Ok(())
+        } else {
+            thread::Builder::new()
+                .name("file-manager-window-listing".into())
+                .spawn(move || {
+                    let entries = load_dir(&listing_path, true);
+                    let _ = listing_sender.send(WorkerMessage::WindowLoaded {
+                        serial,
+                        path: listing_path,
+                        entries,
+                    });
+                    listing_ctx.request_repaint();
+                })
+                .map(|_| ())
+        };
         if let Err(error) = listing_spawn {
             eprintln!("Could not start folder-listing worker: {error}");
             if let Some(child) = self.children.iter_mut().find(|child| child.serial == serial) {

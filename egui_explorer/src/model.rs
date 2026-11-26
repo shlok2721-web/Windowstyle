@@ -545,6 +545,19 @@ impl PermMode {
         (old & !0o777) | owner | group | other
     }
 
+    /// Like [`PermMode::apply_to_mode`], but for a folder. A folder can only be entered with
+    /// its execute (search) bit, so the owner always keeps it: "Read only" becomes `r-x`,
+    /// "Write only" `-wx`, "Read & write" `rwx`, and "Executable" `r-x`. Group and others
+    /// keep only the bits they already had that are also granted to the owner, so nobody
+    /// gains access.
+    pub fn apply_to_dir_mode(self, old: u32) -> u32 {
+        let want = self.bits() | 0o1;
+        let owner = want << 6;
+        let group = old & 0o070 & (want << 3);
+        let other = old & 0o007 & want;
+        (old & !0o777) | owner | group | other
+    }
+
     /// The level that exactly matches the owner bits of `mode`, if any.
     pub fn from_mode(mode: u32) -> Option<PermMode> {
         match (mode >> 6) & 0o7 {
@@ -2778,5 +2791,10 @@ mod nav_preference_tests {
             assert_eq!(PermMode::from_mode(m.apply_to_mode(0o100777)), Some(m));
         }
         assert_eq!(PermMode::from_mode(0o100000), None);
+        // Folders always keep the owner's execute bit so they stay enterable.
+        assert_eq!(PermMode::ReadOnly.apply_to_dir_mode(0o40755), 0o40555);
+        assert_eq!(PermMode::WriteOnly.apply_to_dir_mode(0o40755), 0o40331);
+        assert_eq!(PermMode::ReadWrite.apply_to_dir_mode(0o40700), 0o40700);
+        assert_eq!(PermMode::Executable.apply_to_dir_mode(0o40777), 0o40555);
     }
 }
