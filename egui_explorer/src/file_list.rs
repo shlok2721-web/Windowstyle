@@ -1106,8 +1106,9 @@ fn draw_content(
     // ---- items --------------------------------------------------------------------
     let touch_gesture = finished_touch_gesture(&ctx);
     crate::quadtap::ensure_started(&ctx);
-    let quad_pending = ui.input(|i| i.viewport().focused.unwrap_or(true))
-        && crate::quadtap::pending();
+    let quad_focused = ui.input(|i| i.viewport().focused.unwrap_or(true));
+    let quad_delete_pending = quad_focused && crate::quadtap::pending_delete();
+    let quad_click_pending = quad_focused && crate::quadtap::pending_click();
     let quad_pos = ctx.input(|i| i.pointer.latest_pos());
     let last_click_id = Id::unique("fl_last_click");
     let now_drag = egui::DragAndDrop::has_payload_of_type::<Vec<PathBuf>>(&ctx);
@@ -1235,29 +1236,40 @@ fn draw_content(
                     }
                 });
             }
-            // Multi-finger gestures on an item. Touchscreen: 3 fingers copy, 4+ delete
-            // permanently. Touchpad / mouse: a three-finger click arrives as a middle click
-            // (copy); Ctrl+Shift+middle click stands in for the four-finger click (touchpads
-            // cannot report four fingers). Delete always asks for confirmation first.
+            // Multi-finger gestures on an item. Touchscreen: 3 fingers copy, 4+ (held ~2s,
+            // see `quadtap`) delete permanently. Touchpad / mouse: a three-finger click
+            // arrives as a middle click (copy); Ctrl+Shift+middle click stands in for the
+            // four-finger hold (touchpads cannot report four fingers). Delete always asks
+            // for confirmation first.
             let middle = resp.clicked_by(PointerButton::Middle);
             let gesture_fingers = touch_gesture
                 .filter(|(_, pos)| r.contains(*pos))
                 .map(|(n, _)| n);
-            // A four-finger click read straight from the touchpad (see `quadtap`).
-            let quad_here = quad_pending
+            // A four-finger press read straight from the touchpad (see `quadtap`): a ~2s
+            // hold deletes, a plain 0.6-1.2s click just selects like an ordinary click.
+            let quad_delete_here = quad_delete_pending
                 && quad_pos.is_some_and(|p| r.contains(p))
-                && crate::quadtap::consume();
-            let want_delete = quad_here
+                && crate::quadtap::consume_delete();
+            let quad_click_here = quad_click_pending
+                && quad_pos.is_some_and(|p| r.contains(p))
+                && crate::quadtap::consume_click();
+            let want_delete = quad_delete_here
                 || gesture_fingers.is_some_and(|n| n >= 4)
                 || (middle && mods.ctrl && mods.shift);
             let want_copy = !want_delete && (gesture_fingers == Some(3) || middle);
             if want_delete {
-                acts.push(Act::Select {
-                    sel: HashSet::from([e.path.clone()]),
-                    focus: Some(e.path.clone()),
-                    anchor: Some(e.path.clone()),
-                });
+                // Landing on an item that's already part of a multi-selection deletes the
+                // whole selection; otherwise it narrows the selection to just this item.
+                if !(selected && st.selection.len() > 1) {
+                    acts.push(Act::Select {
+                        sel: HashSet::from([e.path.clone()]),
+                        focus: Some(e.path.clone()),
+                        anchor: Some(e.path.clone()),
+                    });
+                }
                 acts.push(Act::Cmd(Command::DeletePermanently));
+            } else if quad_click_here {
+                acts.push(click_selection(st, layout, k, mods));
             } else if want_copy {
                 if !selected {
                     acts.push(Act::Select {

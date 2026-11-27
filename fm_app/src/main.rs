@@ -149,6 +149,8 @@ struct OpenWithDialog {
     apps: Vec<open_with::AppEntry>,
     /// Expanded view: every installed application plus the custom-command field.
     show_all: bool,
+    /// Filters the app list by name as the user types.
+    search: String,
     custom: String,
     /// "Remember my choice" tick box.
     remember: bool,
@@ -645,6 +647,11 @@ struct AppCore {
     /// The first window was closed while other windows were open: it is only hidden, because
     /// closing egui's root window would end the whole process.
     root_hidden: bool,
+    /// While `root_hidden`, the child window that currently stands in for it: besides the
+    /// root's own (possibly slow, possibly compositor-starved) pass, this window's own live
+    /// frame also re-announces the other windows, so the group doesn't depend solely on the
+    /// hidden root getting ticked. Re-picked from whatever remains whenever it closes.
+    anchor_child: Option<egui::ViewportId>,
     /// The program is really shutting down (SIGTERM, logout, last window gone).
     quitting: bool,
     /// `(location, view)` for the folder currently on screen, as last applied or saved.
@@ -977,6 +984,7 @@ impl AppCore {
             hyprland_placement_tx,
             hyprland_placements,
             root_hidden: false,
+            anchor_child: None,
             quitting: false,
             folder_view_active,
         };
@@ -1706,12 +1714,28 @@ impl AppCore {
                         ui.separator();
                     }
 
+                    // Search box: lets the user find an app by name instead of scrolling.
+                    ui.add(
+                        egui::TextEdit::singleline(&mut dialog.search)
+                            .hint_text("Search applications…")
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.add_space(2.0);
+
                     let list: Vec<open_with::AppEntry> = if dialog.show_all {
                         dialog.apps.clone()
                     } else {
                         open_with::handlers_for(&dialog.apps, &mime)
                             .into_iter()
                             .cloned()
+                            .collect()
+                    };
+                    let query = dialog.search.trim().to_lowercase();
+                    let list: Vec<open_with::AppEntry> = if query.is_empty() {
+                        list
+                    } else {
+                        list.into_iter()
+                            .filter(|a| a.name.to_lowercase().contains(&query))
                             .collect()
                     };
                     egui::ScrollArea::vertical()
@@ -3414,6 +3438,7 @@ impl AppCore {
                     mime: String::new(),
                     apps: Vec::new(),
                     show_all: false,
+                    search: String::new(),
                     custom: String::new(),
                     remember: false,
                     anchor: ctx
@@ -3443,6 +3468,7 @@ impl AppCore {
                         mime: open_with::mime_for(first),
                         apps: open_with::all_apps(),
                         show_all: false,
+                        search: String::new(),
                         custom: String::new(),
                         remember: false,
                         share: None,
@@ -4088,95 +4114,125 @@ impl AppCore {
             .collect();
 
         for (id, builder_title) in windows {
-            let shared = Arc::clone(shared);
-            let builder = egui::ViewportBuilder::default()
-                .with_title(builder_title)
-                .with_inner_size([1100.0, 680.0])
-                .with_min_inner_size([640.0, 420.0]);
-
-            ctx.show_viewport_deferred(id, builder, move |ui, _class| {
-                let window_ctx = ui.ctx().clone();
-                let mut core = shared
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let Some(index) = core.children.iter().position(|child| child.id == id) else {
-                    // The root removed this child after its close request. Stop presenting it.
-                    window_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    return;
-                };
-
-                let mut child = core.children.remove(index);
-                if !child.request_active.load(Ordering::Acquire) {
-                    // The launch timed out and started a standalone process. Close this viewport
-                    // if it raced with cancellation, and never reinsert the stale child record.
-                    window_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    if core.root_hidden && core.children.is_empty() {
-                        core.quitting = true;
-                        core.egui_ctx.send_viewport_cmd_to(
-                            egui::ViewportId::ROOT,
-                            egui::ViewportCommand::Close,
-                        );
-                    } else {
-                        core.egui_ctx.request_repaint_of(egui::ViewportId::ROOT);
-                    }
-                    return;
-                }
-                if let Some(ack) = child.opened_ack.take() {
-                    eprintln!("Windowstyle: child viewport {:?} created; acknowledging request.", id);
-                    let _ = ack.send(true);
-                }
-                if window_ctx.input(|input| input.viewport().close_requested()) {
-                    child.close = true;
-                } else {
-                    if child.fresh {
-                        child.fresh = false;
-                        // Hyprland performs the precise workspace handoff. Otherwise ask the
-                        // native window backend to focus this window when it is first shown.
-                        if child.launch_title.is_none()
-                            && std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none()
-                        {
-                            // On Hyprland, never fall back to native focus for a launch whose
-                            // workspace handoff failed: its default parent workspace may be the
-                            // original root's workspace, and focusing it would recreate the bug.
-                            // The IPC worker owns focus in Hyprland; other desktops use eframe.
-                            window_ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                        }
-                    }
-
-                    // Existing application code is written against one active view state. Swap
-                    // this child's state in for the duration of its frame, while shared caches,
-                    // settings, workers, clipboard and operations remain in the single process.
-                    core.swap_window(&mut child);
-                    core.window_frame(ui, &window_ctx);
-                    let title = window_title(&core.state.location);
-                    core.swap_window(&mut child);
-
-                    if child.launch_title.is_none() && title != child.title {
-                        child.title = title.clone();
-                        window_ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
-                    }
-                }
-
-                if !child.close {
-                    let insertion = index.min(core.children.len());
-                    core.children.insert(insertion, child);
-                } else {
-                    // Explicitly wake the root, not whichever deferred viewport last used this
-                    // Context. If the root was hidden and this was the last child, close it
-                    // directly: an invisible root may not receive another compositor frame.
-                    if core.root_hidden && core.children.is_empty() {
-                        core.quitting = true;
-                        core.egui_ctx.send_viewport_cmd_to(
-                            egui::ViewportId::ROOT,
-                            egui::ViewportCommand::Close,
-                        );
-                    } else {
-                        core.egui_ctx.request_repaint_of(egui::ViewportId::ROOT);
-                    }
-                }
-            });
+            register_child_window(Arc::clone(shared), ctx, id, builder_title);
         }
     }
+}
+
+/// Registers (or re-registers) one child window as a deferred viewport, from whichever
+/// context calls it. Normally that is always the root's own pass; see `register_child_window`'s
+/// call from inside this closure for the one case where a surviving window also calls it, as
+/// insurance while the root is hidden.
+fn register_child_window(
+    shared: Arc<Mutex<AppCore>>,
+    host_ctx: &egui::Context,
+    id: egui::ViewportId,
+    builder_title: String,
+) {
+    let builder = egui::ViewportBuilder::default()
+        .with_title(builder_title)
+        .with_inner_size([1100.0, 680.0])
+        .with_min_inner_size([640.0, 420.0]);
+
+    host_ctx.show_viewport_deferred(id, builder, move |ui, _class| {
+            let window_ctx = ui.ctx().clone();
+            let mut core = shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(index) = core.children.iter().position(|child| child.id == id) else {
+                // The root removed this child after its close request. Stop presenting it.
+                window_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                return;
+            };
+
+            let mut child = core.children.remove(index);
+
+            // Insurance, not a replacement: while the root is hidden, the window the user
+            // is actually looking at also re-announces its siblings here, on its own,
+            // definitely-live frame, instead of the whole group depending solely on the
+            // hidden root's own (possibly compositor-starved) tick. The root's pass above
+            // still owns opening/closing bookkeeping and keeps registering everyone too;
+            // this only adds a second, more reliable path to keep registrations warm.
+            if core.root_hidden && core.anchor_child == Some(id) {
+                let siblings: Vec<(egui::ViewportId, String)> = core
+                    .children
+                    .iter()
+                    .map(|c| (c.id, c.launch_title.as_ref().unwrap_or(&c.title).clone()))
+                    .collect();
+                for (sid, stitle) in siblings {
+                    register_child_window(Arc::clone(&shared), &window_ctx, sid, stitle);
+                }
+            }
+
+            if !child.request_active.load(Ordering::Acquire) {
+                // The launch timed out and started a standalone process. Close this viewport
+                // if it raced with cancellation, and never reinsert the stale child record.
+                window_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                if core.root_hidden && core.children.is_empty() {
+                    core.quitting = true;
+                    core.egui_ctx.send_viewport_cmd_to(
+                        egui::ViewportId::ROOT,
+                        egui::ViewportCommand::Close,
+                    );
+                } else {
+                    core.egui_ctx.request_repaint_of(egui::ViewportId::ROOT);
+                }
+                return;
+            }
+            if let Some(ack) = child.opened_ack.take() {
+                eprintln!("Windowstyle: child viewport {:?} created; acknowledging request.", id);
+                let _ = ack.send(true);
+            }
+            if window_ctx.input(|input| input.viewport().close_requested()) {
+                child.close = true;
+            } else {
+                if child.fresh {
+                    child.fresh = false;
+                    // Hyprland performs the precise workspace handoff. Otherwise ask the
+                    // native window backend to focus this window when it is first shown.
+                    if child.launch_title.is_none()
+                        && std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none()
+                    {
+                        // On Hyprland, never fall back to native focus for a launch whose
+                        // workspace handoff failed: its default parent workspace may be the
+                        // original root's workspace, and focusing it would recreate the bug.
+                        // The IPC worker owns focus in Hyprland; other desktops use eframe.
+                        window_ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    }
+                }
+
+                // Existing application code is written against one active view state. Swap
+                // this child's state in for the duration of its frame, while shared caches,
+                // settings, workers, clipboard and operations remain in the single process.
+                core.swap_window(&mut child);
+                core.window_frame(ui, &window_ctx);
+                let title = window_title(&core.state.location);
+                core.swap_window(&mut child);
+
+                if child.launch_title.is_none() && title != child.title {
+                    child.title = title.clone();
+                    window_ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+                }
+            }
+
+            if !child.close {
+                let insertion = index.min(core.children.len());
+                core.children.insert(insertion, child);
+            } else {
+                // Explicitly wake the root, not whichever deferred viewport last used this
+                // Context. If the root was hidden and this was the last child, close it
+                // directly: an invisible root may not receive another compositor frame.
+                if core.root_hidden && core.children.is_empty() {
+                    core.quitting = true;
+                    core.egui_ctx.send_viewport_cmd_to(
+                        egui::ViewportId::ROOT,
+                        egui::ViewportCommand::Close,
+                    );
+                } else {
+                    core.egui_ctx.request_repaint_of(egui::ViewportId::ROOT);
+                }
+            }
+            });
 }
 
 /// Existing paths from clipboard text: `file://` URIs (`text/uri-list`, percent-encoded) or
@@ -4276,6 +4332,18 @@ impl AppCore {
         self.window_frame(ui, &ctx);
         self.sync_remembered_prefs();
         self.reload_settings_if_edited(&ctx);
+        // While the root is hidden, keep `anchor_child` pointing at a window that still
+        // exists, promoting a different surviving window the moment the current one closes.
+        if self.root_hidden {
+            if !self
+                .anchor_child
+                .is_some_and(|id| self.children.iter().any(|c| c.id == id))
+            {
+                self.anchor_child = self.children.first().map(|c| c.id);
+            }
+        } else {
+            self.anchor_child = None;
+        }
         self.child_windows(shared, &ctx);
         self.tick_persistence(&ctx);
         self.tick_drive_poll(&ctx);
